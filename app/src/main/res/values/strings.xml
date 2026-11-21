@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">DSK LOCKER</string>
+    <string name="brand_name">DSK OFFICIAL</string>
+    <string name="tagline">YOUR DIGITAL WORLD. YOUR PRIVATE UNIVERSE.</string>
+    <string name="welcome_back">Welcome Back!</string>
+    <string name="enter_mpin">Enter Your MPIN</string>
+    <string name="unlock">UNLOCK</string>
+    <string name="forgot_mpin">Forgot MPIN</string>
+    <string name="biometric_unlock">Biometric Unlock</string>
+    <string name="create_mpin">Create 6-Digit MPIN</string>
+    <string name="confirm_mpin">Confirm 6-Digit MPIN</string>
+    <string name="mobile_login_title">Owner Verification</string>
+    <string name="send_sms_otp">Send SMS OTP</string>
+    <string name="verify_otp">Verify 6-Digit OTP</string>
+    <string name="download_to_phone">DOWNLOAD TO PHONE</string>
+    <string name="delete_mobile_only">DELETE FROM MOBILE ONLY</string>
+    <string name="delete_cloud_only">DELETE FROM CLOUD ONLY</string>
+    <string name="delete_both">DELETE FROM BOTH</string>
+    <string name="secure_vault">Secure Vault</string>
+    <string name="recycle_bin">Recycle Bin</string>
+    <string name="about_dsk_desc">DSK LOCKER Ultimate 4D Personal Edition is a private single-owner cloud storage, AI document reader, and AES-256-GCM encrypted vault crafted by DSK OFFICIAL.</string>
+    <string name="scan_document">Scan Document</string>
+    <string name="scan_document_subtitle">Camera + ML Kit live document detection for AI OCR Reader</string>
+    <string name="camera_permission_title">Camera Access Needed</string>
+    <string name="camera_permission_desc">Allow camera access to detect physical documents in real time with ML Kit and send them straight to the AI OCR Reader.</string>
+    <string name="grant_camera_permission">Enable Camera Scanner</string>
+    <string name="mlkit_smart_scanner">ML Kit Auto-Crop Scanner</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "DSK LOCKER",
+  "description": "Personal cloud storage, AI document OCR reader, encrypted vault, and automated backup manager.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

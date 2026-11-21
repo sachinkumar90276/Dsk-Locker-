@@ -1,0 +1,38 @@
+# Gradle & Kotlin
+*.iml
+.gradle/
+.kotlin/
+/build/
+/app/build/
+.build-outputs/
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE & OS
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+
+# Secrets, Signing & Environment Files (NEVER commit to GitHub)
+local.properties
+/local.properties
+.env
+*.env.local
+backend/.env
+backend/*.env.local
+firebase-service-account.json
+*service-account*.json
+*.jks
+*.keystore
+*.p12
+*.pem
+debug.keystore
+
+# Optional Backend Node build artifacts
+backend/node_modules/
+backend/dist/
