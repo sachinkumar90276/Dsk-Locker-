@@ -27,31 +27,28 @@ jobs:
           set -eo pipefail
 
           SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          mkdir -p "$SDK_DIR"
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "ERROR: Preinstalled Android SDK directory not found at: $SDK_DIR"
+            exit 1
+          fi
 
           SDKMANAGER=""
           if [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
             SDKMANAGER="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
           else
-            FOUND_SDKMANAGER=$(find "$SDK_DIR" -maxdepth 4 -type f -name sdkmanager 2>/dev/null | head -n 1 || true)
-            if [ -n "$FOUND_SDKMANAGER" ]; then
+            FOUND_SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -maxdepth 4 -type f -name sdkmanager 2>/dev/null | head -n 1 || true)
+            if [ -n "$FOUND_SDKMANAGER" ] && [ -x "$FOUND_SDKMANAGER" ]; then
               SDKMANAGER="$FOUND_SDKMANAGER"
+            elif command -v sdkmanager >/dev/null 2>&1; then
+              SDKMANAGER="$(command -v sdkmanager)"
             fi
           fi
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "Android cmdline-tools not found in $SDK_DIR; downloading official command-line tools..."
-            CMDLINE_ZIP="/tmp/commandlinetools.zip"
-            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o "$CMDLINE_ZIP"
-            mkdir -p "$SDK_DIR/cmdline-tools/tmp"
-            unzip -q -o "$CMDLINE_ZIP" -d "$SDK_DIR/cmdline-tools/tmp"
-            rm -rf "$SDK_DIR/cmdline-tools/latest"
-            mv "$SDK_DIR/cmdline-tools/tmp/cmdline-tools" "$SDK_DIR/cmdline-tools/latest"
-            rm -rf "$SDK_DIR/cmdline-tools/tmp" "$CMDLINE_ZIP"
-            SDKMANAGER="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+            echo "ERROR: sdkmanager not found under $SDK_DIR/cmdline-tools or PATH."
+            exit 1
           fi
 
-          chmod +x "$SDKMANAGER"
           SDKMANAGER_BIN_DIR="$(dirname "$SDKMANAGER")"
 
           echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
@@ -59,7 +56,8 @@ jobs:
           echo "$SDKMANAGER_BIN_DIR" >> "$GITHUB_PATH"
           echo "$SDK_DIR/platform-tools" >> "$GITHUB_PATH"
 
-          echo "Using sdkmanager at: $SDKMANAGER"
+          echo "Using preinstalled Android SDK at: $SDK_DIR"
+          "$SDKMANAGER" --version
           { yes || true; } | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses > /dev/null
           "$SDKMANAGER" --sdk_root="$SDK_DIR" --install \
             "platform-tools" \
