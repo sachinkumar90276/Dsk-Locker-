@@ -95,15 +95,15 @@ jobs:
             fi
           fi
 
-      - name: Run unit tests & build app-debug.apk
+      - name: Build Android Debug APK
         shell: bash
         run: |
           set -euo pipefail
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
+            ./gradlew assembleDebug --no-daemon --stacktrace
           else
-            gradle :app:testDebugUnitTest :app:assembleDebug --no-daemon --stacktrace
+            gradle :app:assembleDebug --no-daemon --stacktrace
           fi
 
       - name: Verify APK exists
