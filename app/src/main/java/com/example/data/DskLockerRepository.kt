@@ -4,8 +4,11 @@ import android.app.Activity
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import com.example.ai.DeterministicDocumentParser
 import com.example.ai.DocumentOcrEngine
 import com.example.ai.DocumentOcrResult
+import com.example.ai.ExtendedOcrMetadata
+import com.example.ai.OcrMetadataStore
 import com.example.data.local.*
 import com.example.data.remote.*
 import com.example.security.CryptoManager
@@ -386,6 +389,7 @@ class DskLockerRepository(private val context: Context) {
         }
         deleteRemoteRowIfAuthenticated("files", file.id)
         db.documentReminderDao().deleteForFile(file.id)
+        OcrMetadataStore.delete(context, file.id)
         db.fileItemDao().hardDeleteById(file.id)
         logSecurity("PERMANENT_DELETE", "Permanently purged ${file.displayName}", true)
     }
@@ -635,6 +639,7 @@ class DskLockerRepository(private val context: Context) {
         when (res) {
             is DocumentOcrResult.Success -> {
                 db.documentExtractionDao().upsert(res.extraction)
+                OcrMetadataStore.save(context, res.extendedMetadata)
                 val nextCategory = if (autoDetectCategory && !res.detectedCategoryId.isNullOrBlank()) {
                     res.detectedCategoryId
                 } else item.categoryId
@@ -673,6 +678,7 @@ class DskLockerRepository(private val context: Context) {
                     updatedAt = System.currentTimeMillis()
                 )
                 db.documentExtractionDao().upsert(partial)
+                OcrMetadataStore.save(context, DeterministicDocumentParser.enrichFromEntity(partial))
                 syncExtraction(partial)
                 if (autoDetectCategory && !res.detectedCategoryId.isNullOrBlank() && res.detectedCategoryId != item.categoryId) {
                     val updatedItem = item.copy(
@@ -689,13 +695,44 @@ class DskLockerRepository(private val context: Context) {
         return res
     }
 
+    fun loadExtendedOcrMetadata(extraction: DocumentExtractionEntity): ExtendedOcrMetadata =
+        OcrMetadataStore.loadOrReconstruct(context, extraction)
+
     suspend fun saveVerifiedExtraction(
         item: FileItemEntity,
         extraction: DocumentExtractionEntity,
-        applySuggestedDisplayName: Boolean = false
+        applySuggestedDisplayName: Boolean = false,
+        extendedMetadata: ExtendedOcrMetadata? = null
     ) {
-        val verified = extraction.copy(isVerified = true, updatedAt = System.currentTimeMillis())
+        val verified = if (extendedMetadata != null) {
+            extendedMetadata.toDocumentExtractionEntity(
+                rawText = extraction.rawText,
+                isVerified = true
+            )
+        } else {
+            extraction.copy(isVerified = true, updatedAt = System.currentTimeMillis())
+        }
         db.documentExtractionDao().upsert(verified)
+
+        if (extendedMetadata != null) {
+            val finalizedMeta = DeterministicDocumentParser.finalizeScoresAndMissing(
+                extendedMetadata.copy(
+                    needsReviewFields = emptySet(),
+                    stageSummary = "Verified by user"
+                ),
+                verified.rawText
+            )
+            OcrMetadataStore.save(context, finalizedMeta)
+        } else {
+            OcrMetadataStore.save(
+                context,
+                DeterministicDocumentParser.enrichFromEntity(verified).copy(
+                    needsReviewFields = emptySet(),
+                    stageSummary = "Verified by user"
+                )
+            )
+        }
+
         val newDisplayName = if (applySuggestedDisplayName) {
             ocrEngine.buildDisplayName(verified.documentName, verified.ownerName)
         } else null
@@ -717,6 +754,16 @@ class DskLockerRepository(private val context: Context) {
             syncFileMetadata(updated)
         }
         syncExtraction(verified)
+        if (!verified.expiryDate.isNullOrBlank()) {
+            val reminder = DocumentReminderEntity(
+                fileId = item.id,
+                documentName = newDisplayName ?: verified.documentName ?: item.displayName,
+                expiryDateIso = verified.expiryDate
+            )
+            db.documentReminderDao().upsert(reminder)
+            syncDocumentMetadata(reminder, verified.documentType)
+            BackupScheduler.scheduleDailyExpiryCheck(context)
+        }
     }
 
     suspend fun saveExpiryReminder(reminder: DocumentReminderEntity) {

@@ -44,6 +44,9 @@ import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.example.ai.DeterministicDocumentParser
+import com.example.ai.DocumentFieldProfile
+import com.example.ai.ExtendedOcrMetadata
 import com.example.data.local.*
 import com.example.storage.LocalFileManager
 import com.example.ui.DskLockerViewModel
@@ -275,15 +278,24 @@ fun FileViewerScreen(
                 }
             )
         } else {
+            val loadedExtended = remember(existingExtraction, ocrState, fileItem.id) {
+                val liveSuccess = ocrState as? OcrUiState.Success
+                when {
+                    liveSuccess != null && liveSuccess.extraction.fileId == fileItem.id -> liveSuccess.extended
+                    existingExtraction != null -> viewModel.loadExtendedMetadata(existingExtraction)
+                    else -> ExtendedOcrMetadata(fileId = fileItem.id)
+                }
+            }
             DocumentOcrDetailsPanel(
                 fileItem = fileItem,
                 extraction = existingExtraction,
+                extendedMeta = loadedExtended,
                 reminder = existingReminder,
                 ocrState = ocrState,
                 onRunOcr = { viewModel.runOcrOnFile(fileItem) },
                 onScanNewDocument = onOpenScanner,
-                onSaveVerified = { updated, applyRename ->
-                    viewModel.saveVerifiedExtraction(fileItem, updated, applyRename)
+                onSaveVerified = { updated, updatedMeta, applyRename ->
+                    viewModel.saveVerifiedExtraction(fileItem, updated, applyRename, updatedMeta)
                 },
                 onSaveReminder = { rem ->
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -582,27 +594,47 @@ private fun TextAndDocumentReader(file: File, originalName: String, mimeType: St
 private fun DocumentOcrDetailsPanel(
     fileItem: FileItemEntity,
     extraction: DocumentExtractionEntity?,
+    extendedMeta: ExtendedOcrMetadata,
     reminder: DocumentReminderEntity?,
     ocrState: OcrUiState,
     onRunOcr: () -> Unit,
     onScanNewDocument: () -> Unit,
-    onSaveVerified: (DocumentExtractionEntity, Boolean) -> Unit,
+    onSaveVerified: (DocumentExtractionEntity, ExtendedOcrMetadata, Boolean) -> Unit,
     onSaveReminder: (DocumentReminderEntity) -> Unit
 ) {
     val base = extraction ?: DocumentExtractionEntity(fileId = fileItem.id)
-    var docName by remember(base) { mutableStateOf(base.documentName.orEmpty()) }
-    var docType by remember(base) { mutableStateOf(base.documentType.orEmpty()) }
-    var docNumber by remember(base) { mutableStateOf(base.documentNumber.orEmpty()) }
-    var ownerName by remember(base) { mutableStateOf(base.ownerName.orEmpty()) }
-    var fatherName by remember(base) { mutableStateOf(base.fatherName.orEmpty()) }
-    var motherName by remember(base) { mutableStateOf(base.motherName.orEmpty()) }
-    var dob by remember(base) { mutableStateOf(base.dateOfBirth.orEmpty()) }
-    var issueDate by remember(base) { mutableStateOf(base.issueDate.orEmpty()) }
-    var expiryDate by remember(base) { mutableStateOf(base.expiryDate.orEmpty()) }
-    var address by remember(base) { mutableStateOf(base.address.orEmpty()) }
-    var mobileNumber by remember(base) { mutableStateOf(base.mobileNumber.orEmpty()) }
-    var orgName by remember(base) { mutableStateOf(base.organizationName.orEmpty()) }
-    var regNumber by remember(base) { mutableStateOf(base.registrationNumber.orEmpty()) }
+    val metaKey = remember(base, extendedMeta) { "${base.updatedAt}_${extendedMeta.confidenceScore}_${extendedMeta.documentSpecificFields.size}" }
+
+    var docName by remember(metaKey) { mutableStateOf(extendedMeta.documentName ?: base.documentName.orEmpty()) }
+    var docType by remember(metaKey) { mutableStateOf(extendedMeta.documentType ?: base.documentType.orEmpty()) }
+    var docNumber by remember(metaKey) { mutableStateOf(extendedMeta.documentNumber ?: base.documentNumber.orEmpty()) }
+    var regNumber by remember(metaKey) { mutableStateOf(extendedMeta.registrationNumber ?: base.registrationNumber.orEmpty()) }
+    var ownerName by remember(metaKey) { mutableStateOf(extendedMeta.ownerName ?: base.ownerName.orEmpty()) }
+    var fatherName by remember(metaKey) { mutableStateOf(extendedMeta.fatherName ?: base.fatherName.orEmpty()) }
+    var motherName by remember(metaKey) { mutableStateOf(extendedMeta.motherName ?: base.motherName.orEmpty()) }
+    var dob by remember(metaKey) { mutableStateOf(extendedMeta.dateOfBirth ?: base.dateOfBirth.orEmpty()) }
+    var gender by remember(metaKey) { mutableStateOf(extendedMeta.gender.orEmpty()) }
+    var mobileNumber by remember(metaKey) { mutableStateOf(extendedMeta.mobileNumber ?: base.mobileNumber.orEmpty()) }
+    var email by remember(metaKey) { mutableStateOf(extendedMeta.email.orEmpty()) }
+    var address by remember(metaKey) { mutableStateOf(extendedMeta.address ?: base.address.orEmpty()) }
+    var village by remember(metaKey) { mutableStateOf(extendedMeta.village.orEmpty()) }
+    var city by remember(metaKey) { mutableStateOf(extendedMeta.city.orEmpty()) }
+    var district by remember(metaKey) { mutableStateOf(extendedMeta.district.orEmpty()) }
+    var state by remember(metaKey) { mutableStateOf(extendedMeta.state.orEmpty()) }
+    var pinCode by remember(metaKey) { mutableStateOf(extendedMeta.pinCode.orEmpty()) }
+    var orgName by remember(metaKey) { mutableStateOf(extendedMeta.organizationName ?: base.organizationName.orEmpty()) }
+    var issueDate by remember(metaKey) { mutableStateOf(extendedMeta.issueDate ?: base.issueDate.orEmpty()) }
+    var expiryDate by remember(metaKey) { mutableStateOf(extendedMeta.expiryDate ?: base.expiryDate.orEmpty()) }
+    var issuingAuthority by remember(metaKey) { mutableStateOf(extendedMeta.issuingAuthority.orEmpty()) }
+
+    val specificValues = remember(metaKey) {
+        mutableStateMapOf<String, String>().apply {
+            putAll(extendedMeta.documentSpecificFields)
+        }
+    }
+
+    var showAllFields by remember { mutableStateOf(false) }
+    var selectedPageFilter by remember(metaKey) { mutableIntStateOf(0) } // 0 = All Pages
     var applyRename by remember(fileItem.id) { mutableStateOf(false) }
 
     var r30 by remember(reminder) { mutableStateOf(reminder?.remind30Days ?: true) }
@@ -621,7 +653,78 @@ private fun DocumentOcrDetailsPanel(
             else -> null
         }
     }
-    val isUnclassified = docType.isBlank() || docType.equals("Unclassified Document", ignoreCase = true)
+    val isUnclassified = docType.isBlank() ||
+        docType.equals("Unclassified Document", ignoreCase = true) ||
+        docType.equals("Other Document", ignoreCase = true)
+
+    val hasExistingOcr = base.rawText.isNotBlank() || docName.isNotBlank() || docNumber.isNotBlank()
+    val pageSegments = remember(extendedMeta.pageExtractions, base.rawText) {
+        if (extendedMeta.pageExtractions.isNotEmpty()) extendedMeta.pageExtractions
+        else DeterministicDocumentParser.splitRawTextToPages(base.rawText)
+    }
+
+    fun currentValueForKey(key: String): String = when (key) {
+        DocumentFieldProfile.KEY_DOC_NAME -> docName
+        DocumentFieldProfile.KEY_DOC_TYPE -> docType
+        DocumentFieldProfile.KEY_DOC_NUMBER -> docNumber
+        DocumentFieldProfile.KEY_REG_NUMBER -> regNumber
+        DocumentFieldProfile.KEY_OWNER_NAME -> ownerName
+        DocumentFieldProfile.KEY_FATHER_NAME -> fatherName
+        DocumentFieldProfile.KEY_MOTHER_NAME -> motherName
+        DocumentFieldProfile.KEY_DOB -> dob
+        DocumentFieldProfile.KEY_GENDER -> gender
+        DocumentFieldProfile.KEY_MOBILE -> mobileNumber
+        DocumentFieldProfile.KEY_EMAIL -> email
+        DocumentFieldProfile.KEY_ADDRESS -> address
+        DocumentFieldProfile.KEY_VILLAGE -> village
+        DocumentFieldProfile.KEY_CITY -> city
+        DocumentFieldProfile.KEY_DISTRICT -> district
+        DocumentFieldProfile.KEY_STATE -> state
+        DocumentFieldProfile.KEY_PIN_CODE -> pinCode
+        DocumentFieldProfile.KEY_ORG_NAME -> orgName
+        DocumentFieldProfile.KEY_ISSUE_DATE -> issueDate
+        DocumentFieldProfile.KEY_EXPIRY_DATE -> expiryDate
+        DocumentFieldProfile.KEY_ISSUING_AUTH -> issuingAuthority
+        else -> ""
+    }
+
+    fun updateValueForKey(key: String, value: String) {
+        when (key) {
+            DocumentFieldProfile.KEY_DOC_NAME -> docName = value
+            DocumentFieldProfile.KEY_DOC_TYPE -> docType = value
+            DocumentFieldProfile.KEY_DOC_NUMBER -> docNumber = value
+            DocumentFieldProfile.KEY_REG_NUMBER -> regNumber = value
+            DocumentFieldProfile.KEY_OWNER_NAME -> ownerName = value
+            DocumentFieldProfile.KEY_FATHER_NAME -> fatherName = value
+            DocumentFieldProfile.KEY_MOTHER_NAME -> motherName = value
+            DocumentFieldProfile.KEY_DOB -> dob = value
+            DocumentFieldProfile.KEY_GENDER -> gender = value
+            DocumentFieldProfile.KEY_MOBILE -> mobileNumber = value
+            DocumentFieldProfile.KEY_EMAIL -> email = value
+            DocumentFieldProfile.KEY_ADDRESS -> address = value
+            DocumentFieldProfile.KEY_VILLAGE -> village = value
+            DocumentFieldProfile.KEY_CITY -> city = value
+            DocumentFieldProfile.KEY_DISTRICT -> district = value
+            DocumentFieldProfile.KEY_STATE -> state = value
+            DocumentFieldProfile.KEY_PIN_CODE -> pinCode = value
+            DocumentFieldProfile.KEY_ORG_NAME -> orgName = value
+            DocumentFieldProfile.KEY_ISSUE_DATE -> issueDate = value
+            DocumentFieldProfile.KEY_EXPIRY_DATE -> expiryDate = value
+            DocumentFieldProfile.KEY_ISSUING_AUTH -> issuingAuthority = value
+        }
+    }
+
+    val visibleKeys = remember(docType, showAllFields, metaKey, docName, docNumber, ownerName, address, mobileNumber, email, orgName) {
+        if (showAllFields) {
+            DocumentFieldProfile.allFieldKeys
+        } else {
+            val relevant = DocumentFieldProfile.relevantKeysForType(docType)
+            val populatedExtras = DocumentFieldProfile.allFieldKeys.filter { key ->
+                key !in relevant && currentValueForKey(key).isNotBlank()
+            }
+            (relevant + populatedExtras).distinct()
+        }
+    }
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxSize()) {
         item {
@@ -638,11 +741,18 @@ private fun DocumentOcrDetailsPanel(
                     if (ocrState is OcrUiState.Analyzing) {
                         CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = VoidBlack)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Reading & Extracting Document...", fontWeight = FontWeight.Bold)
+                        Text("Scanning & Extracting Document...", fontWeight = FontWeight.Bold)
                     } else {
-                        Icon(Icons.Filled.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(
+                            if (hasExistingOcr) Icons.Filled.Refresh else Icons.Filled.AutoAwesome,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Run AI Document Reader & OCR", fontWeight = FontWeight.Bold)
+                        Text(
+                            if (hasExistingOcr) "Reprocess Document (Advanced OCR)" else "Run AI Document Reader & OCR",
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
                 OutlinedButton(
@@ -660,10 +770,111 @@ private fun DocumentOcrDetailsPanel(
             }
         }
 
+        if (ocrState is OcrUiState.Analyzing) {
+            item {
+                GlassCard4D(glowColor = ElectricBlue, contentPadding = PaddingValues(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = ocrState.stageLabel,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = ElectricBlue,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "${(ocrState.progress * 100).toInt()}%",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = SilverWhite
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LinearProgressIndicator(
+                        progress = { ocrState.progress.coerceIn(0.05f, 1f) },
+                        color = ElectricBlue,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
+
         if (ocrState is OcrUiState.Error) {
             item {
                 GlassCard4D(glowColor = CrimsonAlert, contentPadding = PaddingValues(12.dp)) {
-                    Text(ocrState.message, color = CrimsonAlert, style = MaterialTheme.typography.bodyMedium)
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(ocrState.message, color = CrimsonAlert, style = MaterialTheme.typography.bodyMedium)
+                        if (ocrState.canRetry) {
+                            OutlinedButton(
+                                onClick = onRunOcr,
+                                border = BorderStroke(1.dp, CrimsonAlert),
+                                modifier = Modifier.testTag("retry_ocr_button")
+                            ) {
+                                Icon(Icons.Filled.Refresh, contentDescription = null, tint = CrimsonAlert, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Retry OCR", color = SilverWhite)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val successNotice = (ocrState as? OcrUiState.Success)?.notice
+        if (!successNotice.isNullOrBlank()) {
+            item {
+                GlassCard4D(glowColor = AmberPending, contentPadding = PaddingValues(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Info, contentDescription = null, tint = AmberPending, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(successNotice, color = SilverWhite, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        }
+
+        if (hasExistingOcr || extendedMeta.confidenceScore > 0) {
+            item {
+                val confColor = when (extendedMeta.confidenceLabel) {
+                    "HIGH" -> EmeraldSync
+                    "MEDIUM" -> AmberPending
+                    else -> CrimsonAlert
+                }
+                GlassCard4D(glowColor = confColor, contentPadding = PaddingValues(14.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("OCR CONFIDENCE & QUALITY", style = MaterialTheme.typography.labelLarge, color = confColor)
+                        Surface(
+                            color = confColor.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(1.dp, confColor)
+                        ) {
+                            Text(
+                                text = "${extendedMeta.confidenceScore}% • ${extendedMeta.confidenceLabel}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = confColor,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                    if (extendedMeta.stageSummary.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(extendedMeta.stageSummary, style = MaterialTheme.typography.bodySmall, color = SilverWhite)
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    if (extendedMeta.missingExpectedFields.isEmpty()) {
+                        Text(
+                            "All expected core fields extracted for this document type.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EmeraldSync
+                        )
+                    } else {
+                        Text(
+                            "Missing Information (${extendedMeta.missingExpectedFields.size}): ${extendedMeta.missingExpectedFields.joinToString(", ")}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AmberPending
+                        )
+                    }
                 }
             }
         }
@@ -682,7 +893,7 @@ private fun DocumentOcrDetailsPanel(
                         border = BorderStroke(1.dp, if (isUnclassified) AmberPending else EmeraldSync)
                     ) {
                         Text(
-                            text = if (isUnclassified) "Unclassified Document" else docType,
+                            text = docType.ifBlank { "Unclassified Document" },
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                             color = if (isUnclassified) AmberPending else EmeraldSync,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
@@ -691,7 +902,7 @@ private fun DocumentOcrDetailsPanel(
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    "Original file name preserved: \"${fileItem.originalFilename}\". Display Name updates only if enabled below.",
+                    "Original filename: \"${fileItem.originalFilename}\" • Bilingual Hindi + English OCR",
                     style = MaterialTheme.typography.labelSmall,
                     color = MetallicSilver
                 )
@@ -705,13 +916,13 @@ private fun DocumentOcrDetailsPanel(
                     ) {
                         Column(modifier = Modifier.padding(10.dp)) {
                             Text(
-                                text = "Suggested Display Name: $suggestedName",
+                                text = "Detected Display Name: $suggestedName",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = ElectricBlue,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Original physical file stays \"${fileItem.originalFilename}\"",
+                                text = "Original physical file remains \"${fileItem.originalFilename}\"",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MetallicSilver
                             )
@@ -719,7 +930,18 @@ private fun DocumentOcrDetailsPanel(
                     }
                 }
                 Spacer(modifier = Modifier.height(10.dp))
-                Text("Quick Classify Document Type", style = MaterialTheme.typography.labelMedium, color = NeonViolet)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Document Type Profile", style = MaterialTheme.typography.labelMedium, color = NeonViolet)
+                    FilterChip(
+                        selected = showAllFields,
+                        onClick = { showAllFields = !showAllFields },
+                        label = { Text(if (showAllFields) "Smart Fields Only" else "Show All 22+ Fields", fontSize = 11.sp) }
+                    )
+                }
                 Spacer(modifier = Modifier.height(6.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(
@@ -729,10 +951,14 @@ private fun DocumentOcrDetailsPanel(
                             "Passport",
                             "Driving Licence",
                             "Voter ID",
-                            "Resume",
+                            "Bank Document",
+                            "Insurance Document",
                             "Certificate",
                             "Bill / Invoice",
-                            "Office Document"
+                            "Resume",
+                            "Office Document",
+                            "Personal Photograph",
+                            "Other Document"
                         )
                     ) { typeLabel ->
                         FilterChip(
@@ -749,19 +975,30 @@ private fun DocumentOcrDetailsPanel(
                 }
                 Spacer(modifier = Modifier.height(10.dp))
 
-                OcrField("Document Name", docName) { docName = it }
-                OcrField("Document Type", docType) { docType = it }
-                OcrField("Document Number", docNumber) { docNumber = it }
-                OcrField("Owner Name", ownerName) { ownerName = it }
-                OcrField("Father Name", fatherName) { fatherName = it }
-                OcrField("Mother Name", motherName) { motherName = it }
-                OcrField("Date of Birth", dob) { dob = it }
-                OcrField("Issue Date (YYYY-MM-DD)", issueDate) { issueDate = it }
-                OcrField("Expiry Date (YYYY-MM-DD)", expiryDate) { expiryDate = it }
-                OcrField("Address", address) { address = it }
-                OcrField("Mobile Number", mobileNumber) { mobileNumber = it }
-                OcrField("Organization Name", orgName) { orgName = it }
-                OcrField("Registration Number", regNumber) { regNumber = it }
+                visibleKeys.forEach { key ->
+                    OcrField(
+                        label = DocumentFieldProfile.labelForKey(key),
+                        value = currentValueForKey(key),
+                        needsReview = key in extendedMeta.needsReviewFields,
+                        multiline = key == DocumentFieldProfile.KEY_ADDRESS,
+                        onChange = { updateValueForKey(key, it) }
+                    )
+                }
+
+                if (specificValues.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Document-Specific Fields", style = MaterialTheme.typography.labelMedium, color = EmeraldSync)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    specificValues.keys.toList().forEach { extraKey ->
+                        OcrField(
+                            label = extraKey,
+                            value = specificValues[extraKey].orEmpty(),
+                            needsReview = false,
+                            multiline = false,
+                            onChange = { specificValues[extraKey] = it }
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(6.dp))
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -776,24 +1013,40 @@ private fun DocumentOcrDetailsPanel(
                 Spacer(modifier = Modifier.height(10.dp))
                 Button(
                     onClick = {
-                        onSaveVerified(
-                            base.copy(
-                                documentName = docName.trim().takeIf { it.isNotBlank() },
-                                documentType = docType.trim().takeIf { it.isNotBlank() },
-                                documentNumber = docNumber.trim().takeIf { it.isNotBlank() },
-                                ownerName = ownerName.trim().takeIf { it.isNotBlank() },
-                                fatherName = fatherName.trim().takeIf { it.isNotBlank() },
-                                motherName = motherName.trim().takeIf { it.isNotBlank() },
-                                dateOfBirth = dob.trim().takeIf { it.isNotBlank() },
-                                issueDate = issueDate.trim().takeIf { it.isNotBlank() },
-                                expiryDate = expiryDate.trim().takeIf { it.isNotBlank() },
-                                address = address.trim().takeIf { it.isNotBlank() },
-                                mobileNumber = mobileNumber.trim().takeIf { it.isNotBlank() },
-                                organizationName = orgName.trim().takeIf { it.isNotBlank() },
-                                registrationNumber = regNumber.trim().takeIf { it.isNotBlank() }
-                            ),
-                            applyRename
+                        val cleanedSpecifics = specificValues.entries
+                            .filter { it.value.isNotBlank() }
+                            .associate { it.key to it.value.trim() }
+
+                        val updatedMeta = extendedMeta.copy(
+                            documentName = docName.trim().takeIf { it.isNotBlank() },
+                            documentType = docType.trim().takeIf { it.isNotBlank() },
+                            ownerName = ownerName.trim().takeIf { it.isNotBlank() },
+                            fatherName = fatherName.trim().takeIf { it.isNotBlank() },
+                            motherName = motherName.trim().takeIf { it.isNotBlank() },
+                            dateOfBirth = dob.trim().takeIf { it.isNotBlank() },
+                            gender = gender.trim().takeIf { it.isNotBlank() },
+                            documentNumber = docNumber.trim().takeIf { it.isNotBlank() },
+                            registrationNumber = regNumber.trim().takeIf { it.isNotBlank() },
+                            mobileNumber = mobileNumber.trim().takeIf { it.isNotBlank() },
+                            email = email.trim().takeIf { it.isNotBlank() },
+                            address = address.trim().takeIf { it.isNotBlank() },
+                            village = village.trim().takeIf { it.isNotBlank() },
+                            city = city.trim().takeIf { it.isNotBlank() },
+                            district = district.trim().takeIf { it.isNotBlank() },
+                            state = state.trim().takeIf { it.isNotBlank() },
+                            pinCode = pinCode.trim().takeIf { it.isNotBlank() },
+                            organizationName = orgName.trim().takeIf { it.isNotBlank() },
+                            issueDate = issueDate.trim().takeIf { it.isNotBlank() },
+                            expiryDate = expiryDate.trim().takeIf { it.isNotBlank() },
+                            issuingAuthority = issuingAuthority.trim().takeIf { it.isNotBlank() },
+                            documentSpecificFields = cleanedSpecifics,
+                            needsReviewFields = emptySet()
                         )
+                        val updatedEntity = updatedMeta.toDocumentExtractionEntity(
+                            rawText = base.rawText,
+                            isVerified = true
+                        )
+                        onSaveVerified(updatedEntity, updatedMeta, applyRename)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
                     modifier = Modifier
@@ -850,9 +1103,46 @@ private fun DocumentOcrDetailsPanel(
         if (base.rawText.isNotBlank()) {
             item {
                 GlassCard4D(contentPadding = PaddingValues(14.dp)) {
-                    Text("RAW EXTRACTED OCR TEXT", style = MaterialTheme.typography.labelLarge, color = ElectricBlue)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("FULL & PER-PAGE OCR TEXT", style = MaterialTheme.typography.labelLarge, color = ElectricBlue)
+                        if (pageSegments.size > 1) {
+                            Text("${pageSegments.size} Pages", style = MaterialTheme.typography.labelSmall, color = EmeraldSync)
+                        }
+                    }
+                    if (pageSegments.size > 1) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            item {
+                                FilterChip(
+                                    selected = selectedPageFilter == 0,
+                                    onClick = { selectedPageFilter = 0 },
+                                    label = { Text("All Pages", fontSize = 11.sp) }
+                                )
+                            }
+                            items(pageSegments) { seg ->
+                                FilterChip(
+                                    selected = selectedPageFilter == seg.pageNumber,
+                                    onClick = { selectedPageFilter = seg.pageNumber },
+                                    label = { Text("Page ${seg.pageNumber}", fontSize = 11.sp) }
+                                )
+                            }
+                        }
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text(base.rawText, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = JetBrainsMonoFamily), color = MetallicSilver)
+                    val displayedRaw = if (selectedPageFilter == 0) {
+                        base.rawText
+                    } else {
+                        pageSegments.firstOrNull { it.pageNumber == selectedPageFilter }?.text ?: base.rawText
+                    }
+                    Text(
+                        text = displayedRaw,
+                        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = JetBrainsMonoFamily),
+                        color = MetallicSilver
+                    )
                 }
             }
         }
@@ -860,12 +1150,25 @@ private fun DocumentOcrDetailsPanel(
 }
 
 @Composable
-private fun OcrField(label: String, value: String, onChange: (String) -> Unit) {
+private fun OcrField(
+    label: String,
+    value: String,
+    needsReview: Boolean = false,
+    multiline: Boolean = false,
+    onChange: (String) -> Unit
+) {
     OutlinedTextField(
         value = value,
         onValueChange = onChange,
-        label = { Text(label) },
-        singleLine = label != "Address",
+        label = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(label)
+                if (needsReview) {
+                    Text("• Needs Review", color = AmberPending, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        singleLine = !multiline,
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)

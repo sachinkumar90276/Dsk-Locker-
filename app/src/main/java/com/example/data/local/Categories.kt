@@ -141,37 +141,56 @@ object DskCategories {
         if (ocrCombined.isNotBlank()) {
             when {
                 ocrCombined.contains("aadhaar") || ocrCombined.contains("aadhar") || ocrCombined.contains("uidai") ||
-                    ocrCombined.contains("unique identification authority") -> return "Aadhaar Card"
+                    ocrCombined.contains("unique identification authority") ||
+                    ocrCombined.contains("आधार") || ocrCombined.contains("विशिष्ट पहचान") -> return "Aadhaar Card"
 
                 ocrCombined.contains("permanent account number") || ocrCombined.contains("income tax department") ||
-                    ocrCombined.contains("pan card") || Regex("""\b[a-z]{5}[0-9]{4}[a-z]\b""").containsMatchIn(ocrCombined) ->
+                    ocrCombined.contains("pan card") || ocrCombined.contains("स्थायी लेखा संख्या") ||
+                    ocrCombined.contains("आयकर विभाग") ||
+                    Regex("""\b[a-z]{5}[0-9]{4}[a-z]\b""").containsMatchIn(ocrCombined) ->
                     return "PAN Card"
 
                 ocrCombined.contains("driving licence") || ocrCombined.contains("driving license") ||
-                    ocrCombined.contains("motor vehicles") || ocrCombined.contains("dl no") ->
+                    ocrCombined.contains("motor vehicles") || ocrCombined.contains("dl no") ||
+                    ocrCombined.contains("ड्राइविंग लाइसेंस") || ocrCombined.contains("सारथी") ->
                     return "Driving Licence"
 
                 ocrCombined.contains("election commission") || ocrCombined.contains("elector photo identity") ||
-                    ocrCombined.contains("voter id") || ocrCombined.contains("voter card") || ocrCombined.contains("epic no") ->
+                    ocrCombined.contains("voter id") || ocrCombined.contains("voter card") || ocrCombined.contains("epic no") ||
+                    ocrCombined.contains("मतदाता") || ocrCombined.contains("निर्वाचन आयोग") ->
                     return "Voter ID"
 
-                ocrCombined.contains("passport") &&
-                    (ocrCombined.contains("republic") || ocrCombined.contains("nationality") || ocrCombined.contains("country code")) ->
+                (ocrCombined.contains("passport") || ocrCombined.contains("पासपोर्ट") || ocrCombined.contains("p<ind")) &&
+                    (ocrCombined.contains("republic") || ocrCombined.contains("nationality") ||
+                        ocrCombined.contains("country code") || ocrCombined.contains("external affairs") ||
+                        ocrCombined.contains("p<")) ->
                     return "Passport"
 
                 ocrCombined.contains("curriculum vitae") || ocrCombined.contains("resume") ||
                     (ocrCombined.contains("experience") && ocrCombined.contains("education") && ocrCombined.contains("skills")) ->
                     return "Resume"
 
+                ocrCombined.contains("insurance") || ocrCombined.contains("policy no") || ocrCombined.contains("policy number") ||
+                    ocrCombined.contains("sum assured") || ocrCombined.contains("mediclaim") ||
+                    ocrCombined.contains("बीमा") || ocrCombined.contains("पॉलिसी") ->
+                    return "Insurance Document"
+
+                ocrCombined.contains("ifsc") || ocrCombined.contains("passbook") || ocrCombined.contains("bank statement") ||
+                    ocrCombined.contains("account statement") || ocrCombined.contains("cif no") ||
+                    (ocrCombined.contains("bank") && (ocrCombined.contains("account no") || ocrCombined.contains("account number") || ocrCombined.contains("branch"))) ->
+                    return "Bank Document"
+
                 ocrCombined.contains("certificate") || ocrCombined.contains("marksheet") ||
                     ocrCombined.contains("university") || ocrCombined.contains("diploma") ||
-                    ocrCombined.contains("board of secondary") || ocrCombined.contains("grade sheet") ->
+                    ocrCombined.contains("board of secondary") || ocrCombined.contains("grade sheet") ||
+                    ocrCombined.contains("प्रमाण पत्र") || ocrCombined.contains("अंकसूची") ->
                     return "Certificate"
 
                 ocrCombined.contains("tax invoice") || ocrCombined.contains("invoice") ||
                     ocrCombined.contains("gstin") || ocrCombined.contains("bill no") ||
                     ocrCombined.contains("total amount") || ocrCombined.contains("amount due") ||
-                    ocrCombined.contains("electricity bill") || ocrCombined.contains("payment receipt") ->
+                    ocrCombined.contains("electricity bill") || ocrCombined.contains("payment receipt") ||
+                    ocrCombined.contains("बिल") || ocrCombined.contains("रसीद") ->
                     return "Bill / Invoice"
             }
         }
@@ -211,7 +230,9 @@ object DskCategories {
         )
 
         val isRecognizedDoc = inferredType != null &&
-            !inferredType.equals("Unclassified Document", ignoreCase = true)
+            !inferredType.equals("Unclassified Document", ignoreCase = true) &&
+            !inferredType.equals("Personal Photograph", ignoreCase = true) &&
+            !inferredType.equals("Other Document", ignoreCase = true)
 
         return when {
             isRecognizedDoc -> CAT_DOCUMENTS
@@ -232,35 +253,40 @@ object DskCategories {
 
         when {
             file.categoryId == CAT_AADHAAR ||
-                docText.contains("aadhaar") || docText.contains("aadhar") || docText.contains("uidai") ->
+                docText.contains("aadhaar") || docText.contains("aadhar") || docText.contains("uidai") ||
+                docText.contains("आधार") ->
                 return DocumentSubcategory.AADHAAR
 
             file.categoryId == CAT_PAN ||
                 docText.contains("pan card") || docText.contains("permanent account number") ||
-                docText.contains("income tax department") ||
+                docText.contains("income tax department") || docText.contains("स्थायी लेखा संख्या") ||
+                docText.contains("आयकर विभाग") ||
                 Regex("""\b[a-z]{5}[0-9]{4}[a-z]\b""").containsMatchIn(docText) ->
                 return DocumentSubcategory.PAN
 
             file.categoryId == CAT_PASSPORT ||
-                (docText.contains("passport") && !docText.contains("photo")) ->
+                ((docText.contains("passport") || docText.contains("पासपोर्ट")) && !docText.contains("photo")) ->
                 return DocumentSubcategory.PASSPORT
 
             file.categoryId == CAT_DRIVING_LICENCE ||
-                docText.contains("driving licence") || docText.contains("driving license") || docText.contains("dl no") ->
+                docText.contains("driving licence") || docText.contains("driving license") ||
+                docText.contains("dl no") || docText.contains("ड्राइविंग लाइसेंस") ->
                 return DocumentSubcategory.DRIVING_LICENCE
 
             file.categoryId == CAT_VOTER_ID ||
-                docText.contains("voter id") || docText.contains("election commission") || docText.contains("elector photo") ->
+                docText.contains("voter id") || docText.contains("election commission") ||
+                docText.contains("elector photo") || docText.contains("मतदाता") ->
                 return DocumentSubcategory.VOTER_ID
 
             docText.contains("resume") || docText.contains("curriculum vitae") ->
                 return DocumentSubcategory.RESUME
 
             docText.contains("certificate") || docText.contains("marksheet") || docText.contains("diploma") ||
-                docText.contains("academic") ->
+                docText.contains("academic") || docText.contains("प्रमाण पत्र") || docText.contains("अंकसूची") ->
                 return DocumentSubcategory.CERTIFICATES
 
-            docText.contains("bill") || docText.contains("invoice") || docText.contains("receipt") || docText.contains("gstin") ->
+            docText.contains("bill") || docText.contains("invoice") || docText.contains("receipt") ||
+                docText.contains("gstin") || docText.contains("बिल") || docText.contains("रसीद") ->
                 return DocumentSubcategory.BILLS
         }
 

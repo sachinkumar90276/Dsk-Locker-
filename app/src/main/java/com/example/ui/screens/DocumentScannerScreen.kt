@@ -68,8 +68,10 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+import com.example.ai.ImagePreprocessor
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -1007,18 +1009,32 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCornerBrackets(
 }
 
 private suspend fun runLocalMlKitText(bitmap: Bitmap): String {
-    val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    return suspendCancellableCoroutine { cont ->
-        recognizer.process(InputImage.fromBitmap(bitmap, 0))
-            .addOnSuccessListener { result ->
-                recognizer.close()
-                cont.resume(result.text.trim())
-            }
-            .addOnFailureListener {
-                recognizer.close()
-                cont.resume("")
-            }
+    val input = InputImage.fromBitmap(bitmap, 0)
+    val latin = runSingleScanRecognizer(TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS), input)
+    val hindi = runSingleScanRecognizer(TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build()), input)
+    val merged = linkedSetOf<String>()
+    latin.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { merged.add(it) }
+    hindi.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { line ->
+        if (line.any { it in '\u0900'..'\u097F' } || merged.none { it.equals(line, true) }) {
+            merged.add(line)
+        }
     }
+    return merged.joinToString("\n")
+}
+
+private suspend fun runSingleScanRecognizer(
+    recognizer: com.google.mlkit.vision.text.TextRecognizer,
+    input: InputImage
+): String = suspendCancellableCoroutine { cont ->
+    recognizer.process(input)
+        .addOnSuccessListener { result ->
+            recognizer.close()
+            cont.resume(result.text.trim())
+        }
+        .addOnFailureListener {
+            recognizer.close()
+            cont.resume("")
+        }
 }
 
 private fun decodeOrientedBitmap(file: File, maxDim: Int): Bitmap? {
@@ -1053,24 +1069,4 @@ private fun decodeOrientedBitmap(file: File, maxDim: Int): Bitmap? {
     }
 }
 
-private fun enhanceScanBitmap(src: Bitmap): Bitmap {
-    val cfg = src.config ?: Bitmap.Config.ARGB_8888
-    val out = Bitmap.createBitmap(src.width, src.height, cfg)
-    val canvas = android.graphics.Canvas(out)
-    val paint = android.graphics.Paint().apply {
-        val contrast = 1.24f
-        val brightness = -12f
-        colorFilter = android.graphics.ColorMatrixColorFilter(
-            android.graphics.ColorMatrix(
-                floatArrayOf(
-                    contrast, 0f, 0f, 0f, brightness,
-                    0f, contrast, 0f, 0f, brightness,
-                    0f, 0f, contrast, 0f, brightness,
-                    0f, 0f, 0f, 1f, 0f
-                )
-            )
-        )
-    }
-    canvas.drawBitmap(src, 0f, 0f, paint)
-    return out
-}
+private fun enhanceScanBitmap(src: Bitmap): Bitmap = ImagePreprocessor.enhanceForOcr(src)

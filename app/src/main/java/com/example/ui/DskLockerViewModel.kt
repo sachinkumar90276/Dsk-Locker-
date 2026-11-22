@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.DocumentOcrResult
+import com.example.ai.ExtendedOcrMetadata
 import com.example.data.DskLockerRepository
 import com.example.data.local.*
 import com.example.data.remote.BackendConfig
@@ -29,9 +30,20 @@ enum class AuthStage {
 
 sealed interface OcrUiState {
     data object Idle : OcrUiState
-    data object Analyzing : OcrUiState
-    data class Success(val extraction: DocumentExtractionEntity, val suggestedName: String?) : OcrUiState
-    data class Error(val message: String) : OcrUiState
+    data class Analyzing(
+        val stageLabel: String = "Preparing document...",
+        val progress: Float = 0.15f
+    ) : OcrUiState
+    data class Success(
+        val extraction: DocumentExtractionEntity,
+        val extended: ExtendedOcrMetadata,
+        val suggestedName: String?,
+        val notice: String? = null
+    ) : OcrUiState
+    data class Error(
+        val message: String,
+        val canRetry: Boolean = true
+    ) : OcrUiState
 }
 
 data class FlashScreenState(
@@ -468,7 +480,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                         val ocrRes = repo.runDocumentOcr(
                             item = item,
                             autoDetectCategory = allowCategoryPromotion,
-                            renameWithSuggested = false,
+                            renameWithSuggested = (item.displayName == item.originalFilename),
                             onProgress = { stageTitle, frac ->
                                 _flashState.value = _flashState.value.copy(
                                     title = stageTitle,
@@ -480,7 +492,14 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                         when (ocrRes) {
                             is DocumentOcrResult.Success -> {
                                 ocrSuccessCount++
-                                if (idx == 0) _ocrState.value = OcrUiState.Success(ocrRes.extraction, ocrRes.suggestedDisplayName)
+                                if (idx == 0) {
+                                    _ocrState.value = OcrUiState.Success(
+                                        extraction = ocrRes.extraction,
+                                        extended = ocrRes.extendedMetadata,
+                                        suggestedName = ocrRes.suggestedDisplayName,
+                                        notice = ocrRes.notice
+                                    )
+                                }
                             }
                             is DocumentOcrResult.PartialRawTextOnly -> {
                                 ocrPartialCount++
@@ -602,7 +621,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                         val res = repo.runDocumentOcr(
                             item = primary,
                             autoDetectCategory = true,
-                            renameWithSuggested = false,
+                            renameWithSuggested = (primary.displayName == primary.originalFilename),
                             onProgress = { stageTitle, frac ->
                                 _flashState.value = _flashState.value.copy(
                                     title = stageTitle,
@@ -612,7 +631,12 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     ) {
                         is DocumentOcrResult.Success -> {
-                            _ocrState.value = OcrUiState.Success(res.extraction, res.suggestedDisplayName)
+                            _ocrState.value = OcrUiState.Success(
+                                extraction = res.extraction,
+                                extended = res.extendedMetadata,
+                                suggestedName = res.suggestedDisplayName,
+                                notice = res.notice
+                            )
                             val docLabel = res.extraction.documentType ?: res.extraction.documentName ?: "Document"
                             ocrOutcomeNote = " Detected: $docLabel."
                         }
@@ -823,42 +847,51 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     // --- AI Document OCR & Expiry Reminders ---
+    fun loadExtendedMetadata(extraction: DocumentExtractionEntity): ExtendedOcrMetadata =
+        repo.loadExtendedOcrMetadata(extraction)
+
     fun runOcrOnFile(file: FileItemEntity, showFlash: Boolean = true) {
         viewModelScope.launch {
-            _ocrState.value = OcrUiState.Analyzing
+            _ocrState.value = OcrUiState.Analyzing("Preparing document...", 0.10f)
             if (showFlash) {
                 _flashState.value = FlashScreenState(
                     isVisible = true,
                     title = "SCANNING DOCUMENT",
                     subtitle = file.originalFilename,
-                    stepLabel = "Analyzing document & extracting text...",
-                    progress = 0.25f
+                    stepLabel = "Enhancing clarity & extracting Hindi/English text...",
+                    progress = 0.20f
                 )
             }
             when (
                 val res = repo.runDocumentOcr(
                     item = file,
                     autoDetectCategory = true,
-                    renameWithSuggested = false,
+                    renameWithSuggested = (file.displayName == file.originalFilename),
                     onProgress = { label, frac ->
+                        _ocrState.value = OcrUiState.Analyzing(label, frac)
                         if (showFlash) {
                             _flashState.value = _flashState.value.copy(
                                 title = label,
                                 stepLabel = file.originalFilename,
-                                progress = frac.coerceIn(0.15f, 0.92f)
+                                progress = frac.coerceIn(0.15f, 0.94f)
                             )
                         }
                     }
                 )
             ) {
                 is DocumentOcrResult.Success -> {
-                    _ocrState.value = OcrUiState.Success(res.extraction, res.suggestedDisplayName)
+                    _ocrState.value = OcrUiState.Success(
+                        extraction = res.extraction,
+                        extended = res.extendedMetadata,
+                        suggestedName = res.suggestedDisplayName,
+                        notice = res.notice
+                    )
                     if (showFlash) {
                         _flashState.value = FlashScreenState(
                             isVisible = true,
                             title = "FILE SAVED SUCCESSFULLY",
                             subtitle = res.extraction.documentName ?: file.displayName,
-                            stepLabel = "Indexed & ready for verification",
+                            stepLabel = res.notice ?: "Indexed & ready for verification",
                             progress = 1f,
                             isSuccess = true
                         )
@@ -901,7 +934,8 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     fun saveVerifiedExtraction(
         file: FileItemEntity,
         extraction: DocumentExtractionEntity,
-        applySuggestedDisplayName: Boolean = false
+        applySuggestedDisplayName: Boolean = false,
+        extendedMetadata: ExtendedOcrMetadata? = null
     ) {
         viewModelScope.launch {
             _flashState.value = FlashScreenState(
@@ -911,7 +945,13 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                 stepLabel = "Saving verified information & search index...",
                 progress = 0.65f
             )
-            repo.saveVerifiedExtraction(file, extraction, applySuggestedDisplayName)
+            repo.saveVerifiedExtraction(file, extraction, applySuggestedDisplayName, extendedMetadata)
+            val refreshedExt = extendedMetadata ?: repo.loadExtendedOcrMetadata(extraction)
+            _ocrState.value = OcrUiState.Success(
+                extraction = extraction.copy(isVerified = true),
+                extended = refreshedExt.copy(needsReviewFields = emptySet(), stageSummary = "Verified by user"),
+                suggestedName = null
+            )
             _flashState.value = FlashScreenState(
                 isVisible = true,
                 title = "FILE SAVED SUCCESSFULLY",

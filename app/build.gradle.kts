@@ -126,6 +126,7 @@ dependencies {
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)
   implementation(libs.mlkit.text.recognition)
+  implementation(libs.mlkit.text.recognition.devanagari)
   implementation(libs.mlkit.document.scanner)
   implementation(libs.kotlinx.serialization.json)
   implementation(libs.kotlinx.coroutines.android)

@@ -2,11 +2,9 @@ package com.example.ai
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
-import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -20,6 +18,7 @@ import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -32,15 +31,17 @@ import org.xmlpull.v1.XmlPullParser
 import java.io.File
 import java.util.zip.ZipInputStream
 import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 private const val TAG = "DocumentOcrEngine"
+private const val MAX_PDF_PAGES_FULL_SCAN = 40
 
 sealed interface DocumentOcrResult {
     data class Success(
         val extraction: DocumentExtractionEntity,
+        val extendedMetadata: ExtendedOcrMetadata,
         val suggestedDisplayName: String?,
-        val detectedCategoryId: String? = null
+        val detectedCategoryId: String? = null,
+        val notice: String? = null
     ) : DocumentOcrResult
 
     data class PartialRawTextOnly(
@@ -55,29 +56,74 @@ sealed interface DocumentOcrResult {
     data class Error(val message: String) : DocumentOcrResult
 }
 
+private data class OrientationOcrOutput(
+    val bestBitmap: Bitmap,
+    val text: String,
+    val appliedRotationDeg: Int,
+    val contrastEnhanced: Boolean
+)
+
+private data class PdfExtractionOutput(
+    val representativeBitmaps: List<Bitmap>,
+    val combinedText: String,
+    val pages: List<PageOcrSegment>
+)
+
 class DocumentOcrEngine(private val context: Context) {
+
+    private val latinRecognizer by lazy {
+        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    }
+
+    private val devanagariRecognizer by lazy {
+        TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
+    }
+
+    private val specificItemSchema by lazy {
+        Schema.obj(
+            properties = mapOf(
+                "key" to Schema.string("Field label e.g. IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Policy Number, Nominee, Sum Assured, GSTIN, Total Amount, Roll Number, CGPA"),
+                "value" to Schema.string("Exact extracted value from the document")
+            )
+        )
+    }
 
     private val extractionSchema by lazy {
         Schema.obj(
             properties = mapOf(
-                "documentName" to Schema.string("Official name of the document (e.g., Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Resume, Certificate, Bill / Invoice, Office Document)", nullable = true),
-                "documentType" to Schema.string("Document category/type (Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Resume, Certificate, Bills, Office Document, or Unclassified Document if unclear)", nullable = true),
-                "documentNumber" to Schema.string("Primary ID or document number explicitly printed on the document", nullable = true),
-                "ownerName" to Schema.string("Full name of the document holder/owner", nullable = true),
-                "fatherName" to Schema.string("Father's name if explicitly printed", nullable = true),
-                "motherName" to Schema.string("Mother's name if explicitly printed", nullable = true),
-                "dateOfBirth" to Schema.string("Date of birth in YYYY-MM-DD or original format if present", nullable = true),
-                "issueDate" to Schema.string("Issue date in YYYY-MM-DD if explicitly present", nullable = true),
-                "expiryDate" to Schema.string("Expiry/valid-until date in YYYY-MM-DD if explicitly present", nullable = true),
-                "address" to Schema.string("Full postal address if printed on document", nullable = true),
-                "mobileNumber" to Schema.string("Phone or mobile number if printed on document", nullable = true),
-                "organizationName" to Schema.string("Issuing authority, institution, bank, or organization name", nullable = true),
-                "registrationNumber" to Schema.string("Registration, enrollment, or reference number if separate from document number", nullable = true)
+                "documentName" to Schema.string("Official name of the document (e.g. Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Bank Document, Insurance Document, Certificate, Bill / Invoice, Resume, Office Document)", nullable = true),
+                "documentType" to Schema.string("Category/type: Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Bank Document, Insurance Document, Certificate, Bill / Invoice, Resume, Office Document, Personal Photograph, or Other Document", nullable = true),
+                "documentNumber" to Schema.string("Primary ID / card / account / policy / invoice / certificate number explicitly printed", nullable = true),
+                "registrationNumber" to Schema.string("Separate registration, enrolment, CIF, PRAN, application, or roll number if present", nullable = true),
+                "ownerName" to Schema.string("Full name of the document holder / owner / customer / student", nullable = true),
+                "fatherName" to Schema.string("Father's name (S/O, D/O, पिता का नाम) if explicitly printed", nullable = true),
+                "motherName" to Schema.string("Mother's name (माता का नाम) if explicitly printed", nullable = true),
+                "dateOfBirth" to Schema.string("Date of birth in YYYY-MM-DD (or YYYY if only Year of Birth printed)", nullable = true),
+                "gender" to Schema.string("Gender (Male, Female, or Transgender) if printed", nullable = true),
+                "mobileNumber" to Schema.string("Phone / mobile number if explicitly printed", nullable = true),
+                "email" to Schema.string("Email address if explicitly printed", nullable = true),
+                "address" to Schema.string("Complete postal address printed on document", nullable = true),
+                "village" to Schema.string("Village / VTC / Gram name from address if present", nullable = true),
+                "city" to Schema.string("City or town name if present", nullable = true),
+                "district" to Schema.string("District name if present", nullable = true),
+                "state" to Schema.string("State or UT name if present", nullable = true),
+                "pinCode" to Schema.string("6-digit postal PIN code if present", nullable = true),
+                "organizationName" to Schema.string("Bank, insurer, university, board, school, company, or vendor name", nullable = true),
+                "issueDate" to Schema.string("Issue / statement / invoice / bill date in YYYY-MM-DD", nullable = true),
+                "expiryDate" to Schema.string("Expiry / valid till / due / maturity date in YYYY-MM-DD", nullable = true),
+                "issuingAuthority" to Schema.string("Issuing authority, RTO, ministry, or signer authority if printed", nullable = true),
+                "specificDetails" to Schema.array(
+                    specificItemSchema,
+                    description = "Any important document-specific fields not in standard keys (IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Place of Birth, Policy Plan, Nominee, Sum Assured, GSTIN, Total Amount, CGPA, Course)",
+                    nullable = true
+                )
             ),
             optionalProperties = listOf(
-                "documentName", "documentType", "documentNumber", "ownerName",
-                "fatherName", "motherName", "dateOfBirth", "issueDate", "expiryDate",
-                "address", "mobileNumber", "organizationName", "registrationNumber"
+                "documentName", "documentType", "documentNumber", "registrationNumber",
+                "ownerName", "fatherName", "motherName", "dateOfBirth", "gender",
+                "mobileNumber", "email", "address", "village", "city", "district",
+                "state", "pinCode", "organizationName", "issueDate", "expiryDate",
+                "issuingAuthority", "specificDetails"
             )
         )
     }
@@ -130,57 +176,91 @@ class DocumentOcrEngine(private val context: Context) {
             return@withContext DocumentOcrResult.Error("Unsupported OCR format ($label). File saved safely without OCR.")
         }
 
-        var previewBitmap: Bitmap? = null
+        val aiBitmaps = mutableListOf<Bitmap>()
+        val pageSegments = mutableListOf<PageOcrSegment>()
         val extractedTextBuilder = StringBuilder()
+        var appliedRotationDeg = 0
+        var contrastEnhanced = false
 
         try {
-            onProgress("SCANNING DOCUMENT", 0.30f)
+            // Stage 1 & 2: Full Document Preprocessing, Orientation Check & Bilingual OCR
+            onProgress("ENHANCING & SCANNING", 0.15f)
             when {
                 mime.startsWith("image/") || ext in setOf("jpg", "jpeg", "png", "webp", "bmp", "heic") -> {
-                    val bmp = decodeScaledBitmap(file, 1600)
+                    val decoded = ImagePreprocessor.decodeWithExifAndResolution(file)
                         ?: return@withContext DocumentOcrResult.Error("Could not decode image file ($ext).")
-                    previewBitmap = bmp
-                    onProgress("SCANNING DOCUMENT", 0.45f)
-                    val ocr = runCatching { recognizeBitmapText(bmp) }.getOrDefault("")
-                    extractedTextBuilder.append(ocr)
+                    onProgress("DETECTING ORIENTATION & TEXT", 0.30f)
+                    val oriented = detectBestOrientationAndRecognize(decoded)
+                    appliedRotationDeg = oriented.appliedRotationDeg
+                    contrastEnhanced = oriented.contrastEnhanced
+                    aiBitmaps.add(scaleForAi(oriented.bestBitmap))
+                    if (oriented.bestBitmap !== aiBitmaps.first()) {
+                        oriented.bestBitmap.recycle()
+                    }
+                    extractedTextBuilder.append(oriented.text)
+                    if (oriented.text.isNotBlank()) {
+                        pageSegments.add(
+                            PageOcrSegment(
+                                pageNumber = 1,
+                                text = oriented.text.trim(),
+                                detectedHeading = oriented.text.lines().firstOrNull { it.isNotBlank() }?.take(60),
+                                confidenceHint = if (oriented.text.length > 80) "HIGH" else "MEDIUM"
+                            )
+                        )
+                    }
                 }
 
                 mime.startsWith("video/") || ext in setOf("mp4", "mkv", "mov", "webm", "avi", "3gp", "m4v") -> {
-                    onProgress("SCANNING DOCUMENT", 0.45f)
+                    onProgress("SCANNING VIDEO FRAMES", 0.35f)
                     val vidResult = extractVideoFrameText(file)
-                    previewBitmap = vidResult.first
+                    vidResult.first?.let { aiBitmaps.add(scaleForAi(it)); if (it !== aiBitmaps.firstOrNull()) it.recycle() }
                     extractedTextBuilder.append(vidResult.second)
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(vidResult.second))
                 }
 
                 mime == "application/pdf" || ext == "pdf" -> {
-                    onProgress("SCANNING DOCUMENT", 0.45f)
-                    val pdfResult = extractPdfPagesAndText(file)
-                    previewBitmap = pdfResult.first
-                    extractedTextBuilder.append(pdfResult.second)
+                    onProgress("SCANNING ALL PDF PAGES", 0.22f)
+                    val pdfOut = extractPdfPagesAndText(file) { label, frac ->
+                        onProgress(label, (0.22f + frac * 0.35f).coerceIn(0.22f, 0.58f))
+                    }
+                    pdfOut.representativeBitmaps.forEach { bmp ->
+                        val scaled = scaleForAi(bmp)
+                        aiBitmaps.add(scaled)
+                        if (scaled !== bmp) bmp.recycle()
+                    }
+                    extractedTextBuilder.append(pdfOut.combinedText)
+                    pageSegments.addAll(pdfOut.pages)
+                    contrastEnhanced = true
                 }
 
                 ext == "docx" || mime.contains("wordprocessingml") -> {
                     extractedTextBuilder.append(extractDocxText(file))
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(extractedTextBuilder.toString()))
                 }
 
                 ext == "xlsx" || mime.contains("spreadsheetml") -> {
                     extractedTextBuilder.append(extractXlsxText(file))
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(extractedTextBuilder.toString()))
                 }
 
                 ext == "pptx" || mime.contains("presentationml") -> {
                     extractedTextBuilder.append(extractPptxText(file))
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(extractedTextBuilder.toString()))
                 }
 
                 ext == "doc" || ext == "xls" || mime == "application/msword" -> {
                     extractedTextBuilder.append(extractLegacyDocPrintableText(file))
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(extractedTextBuilder.toString()))
                 }
 
                 ext in setOf("html", "htm") || mime == "text/html" -> {
                     extractedTextBuilder.append(extractHtmlVisibleText(file.readText(Charsets.UTF_8).take(80_000)))
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(extractedTextBuilder.toString()))
                 }
 
                 else -> {
-                    extractedTextBuilder.append(file.readText(Charsets.UTF_8).take(40_000))
+                    extractedTextBuilder.append(file.readText(Charsets.UTF_8).take(48_000))
+                    pageSegments.addAll(DeterministicDocumentParser.splitRawTextToPages(extractedTextBuilder.toString()))
                 }
             }
 
@@ -188,157 +268,207 @@ class DocumentOcrEngine(private val context: Context) {
             val baseCategory = DskCategories.classifyFile(originalFilename, mime)
             val isVideoOrPhoto = baseCategory == DskCategories.CAT_PHOTOS || baseCategory == DskCategories.CAT_VIDEOS
 
-            if (rawText.isBlank() && previewBitmap == null) {
+            if (rawText.isBlank() && aiBitmaps.isEmpty()) {
                 return@withContext DocumentOcrResult.Error("No readable text found in $originalFilename. File saved safely.")
             }
 
-            onProgress("EXTRACTING INFORMATION", 0.65f)
-            val heuristic = detectBasicDocInfo(rawText, originalFilename, mime, baseCategory)
-            val localNumber = extractExplicitDocumentNumber(rawText, heuristic.second)
+            // Stage 3: Local Bilingual Analysis & Baseline Classification
+            onProgress("ANALYZING DOCUMENT STRUCTURE", 0.62f)
+            val localFallback = DeterministicDocumentParser.parseLocal(
+                fileId = fileId,
+                rawText = rawText,
+                originalFilename = originalFilename,
+                mimeType = mime,
+                pages = pageSegments,
+                orientationAppliedDeg = appliedRotationDeg,
+                enhancedContrastApplied = contrastEnhanced
+            )
 
+            // Stage 4: Structured AI Extraction with Representative Page Visuals + Full Text
             val promptText = buildString {
-                appendLine("Analyze this personal file carefully and extract structured metadata.")
-                appendLine("STRICT RULES:")
-                appendLine("1. Extract ONLY fields that are explicitly and clearly present in the document text or image.")
-                appendLine("2. If ANY field is missing, blurry, ambiguous, or absent, set it to null. NEVER guess or invent data.")
-                appendLine("3. Classify documentType as one of: Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Resume, Certificate, Bills, Office Document — OR 'Unclassified Document' if unclear.")
-                appendLine("4. Normalize issueDate, expiryDate, and dateOfBirth to YYYY-MM-DD only when full day/month/year is clearly readable.")
+                appendLine("You are an expert bilingual (English + Hindi/Devanagari) Indian & international document OCR data extractor.")
+                appendLine("Analyze ALL attached page images and the complete multi-page OCR text carefully.")
+                appendLine("STRICT EXTRACTION RULES:")
+                appendLine("1. Extract ONLY fields that are explicitly and clearly present across ANY page, column, table, or footer.")
+                appendLine("2. NEVER invent, assume, or hallucinate missing fields. Leave absent fields null.")
+                appendLine("3. Support both Hindi and English labels (e.g. नाम/Name, पिता/Father, माता/Mother, जन्म तिथि/DOB, पता/Address, जिला/District, ग्राम/Village).")
+                appendLine("4. Classify documentType concisely (Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Bank Document, Insurance Document, Certificate, Bill / Invoice, Resume, Office Document, Personal Photograph, or Other Document).")
+                appendLine("5. Normalize dateOfBirth, issueDate, and expiryDate to YYYY-MM-DD whenever day, month, and year are readable.")
+                appendLine("6. Split address components into village, city, district, state, and pinCode wherever present in addition to full address.")
+                appendLine("7. Put document-specific extras (IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Place of Birth, Passport File No, Policy Plan, Nominee, Sum Assured, GSTIN, Total Amount, Roll No, CGPA) into specificDetails.")
                 appendLine("Original filename: $originalFilename")
                 if (rawText.isNotBlank()) {
-                    appendLine("\n--- EXTRACTED CONTENT ---")
-                    appendLine(rawText.take(24_000))
+                    appendLine("\n--- COMPLETE DOCUMENT OCR TEXT (${pageSegments.size.coerceAtLeast(1)} PAGE(S)) ---")
+                    appendLine(rawText.take(32_000))
                 }
             }
 
-            onProgress("EXTRACTING INFORMATION", 0.78f)
-            val response = withTimeout(45_000L) {
-                if (previewBitmap != null) {
-                    model.generateContent(
-                        content {
-                            image(previewBitmap)
-                            text(promptText)
-                        }
-                    )
-                } else {
-                    model.generateContent(promptText)
+            onProgress("AI STRUCTURED EXTRACTION", 0.78f)
+            val aiResponseText = runCatching {
+                withTimeout(55_000L) {
+                    if (aiBitmaps.isNotEmpty()) {
+                        model.generateContent(
+                            content {
+                                aiBitmaps.forEach { bmp -> image(bmp) }
+                                text(promptText)
+                            }
+                        ).text
+                    } else {
+                        model.generateContent(promptText).text
+                    }
                 }
-            }
+            }.onFailure { err ->
+                if (err is CancellationException && err !is TimeoutCancellationException) throw err
+                Log.w(TAG, "AI extraction unavailable/timed out; falling back to local bilingual parser", err)
+            }.getOrNull()?.takeIf { it.isNotBlank() }
 
-            val jsonText = response.text?.takeIf { it.isNotBlank() }
-            if (jsonText == null) {
+            if (aiResponseText == null) {
                 if (rawText.isBlank() && isVideoOrPhoto) {
                     return@withContext DocumentOcrResult.Error("No readable document text detected in media.")
                 }
-                val detectedCat = DskCategories.classifyFromOcrContent(
+                return@withContext buildLocalRecoverySuccess(
+                    fileId = fileId,
+                    localFallback = localFallback,
                     rawText = rawText,
-                    detectedDocName = heuristic.first,
-                    detectedDocType = heuristic.second,
                     originalFilename = originalFilename,
-                    mimeType = mime,
-                    currentCategoryId = baseCategory
-                )
-                return@withContext DocumentOcrResult.PartialRawTextOnly(
-                    rawText = rawText,
-                    errorMessage = "Saved extracted text. Review and verify details manually.",
-                    detectedDocumentName = heuristic.first,
-                    detectedDocumentType = heuristic.second,
-                    detectedDocumentNumber = localNumber,
-                    detectedCategoryId = detectedCat
+                    mime = mime,
+                    baseCategory = baseCategory,
+                    notice = "Extracted offline using Hindi+English OCR engine. Verify and save details."
                 )
             }
 
-            val json = JSONObject(jsonText)
-            val aiDocName = json.optNullableString("documentName")
-            val aiDocType = json.optNullableString("documentType")
-            val contentDetectedType = DskCategories.detectDocumentTypeFromContent(
-                rawText = rawText,
-                detectedDocName = aiDocName,
-                detectedDocType = aiDocType,
-                originalFilename = originalFilename,
-                mimeType = mime
-            )
-            val finalDocType = when {
-                !contentDetectedType.isNullOrBlank() -> contentDetectedType
-                !aiDocType.isNullOrBlank() -> aiDocType
-                baseCategory == DskCategories.CAT_DOCUMENTS -> "Unclassified Document"
-                else -> null
+            onProgress("VALIDATING & VERIFYING FIELDS", 0.92f)
+            val json = JSONObject(aiResponseText)
+            val specificsMap = linkedMapOf<String, String>()
+            json.optJSONArray("specificDetails")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val k = item.optNullableString("key") ?: continue
+                    val v = item.optNullableString("value") ?: continue
+                    specificsMap[k] = v
+                }
             }
-            val finalDocName = aiDocName ?: heuristic.first ?: contentDetectedType
-            val ownerName = json.optNullableString("ownerName")
 
-            val extraction = DocumentExtractionEntity(
+            val aiMeta = ExtendedOcrMetadata(
                 fileId = fileId,
-                documentName = finalDocName,
-                documentType = finalDocType,
-                documentNumber = json.optNullableString("documentNumber") ?: localNumber,
-                ownerName = ownerName,
+                documentName = json.optNullableString("documentName"),
+                documentType = json.optNullableString("documentType"),
+                ownerName = json.optNullableString("ownerName"),
                 fatherName = json.optNullableString("fatherName"),
                 motherName = json.optNullableString("motherName"),
                 dateOfBirth = json.optNullableString("dateOfBirth"),
+                gender = json.optNullableString("gender"),
+                documentNumber = json.optNullableString("documentNumber"),
+                registrationNumber = json.optNullableString("registrationNumber"),
+                mobileNumber = json.optNullableString("mobileNumber"),
+                email = json.optNullableString("email"),
+                address = json.optNullableString("address"),
+                village = json.optNullableString("village"),
+                city = json.optNullableString("city"),
+                district = json.optNullableString("district"),
+                state = json.optNullableString("state"),
+                pinCode = json.optNullableString("pinCode"),
+                organizationName = json.optNullableString("organizationName"),
                 issueDate = json.optNullableString("issueDate"),
                 expiryDate = json.optNullableString("expiryDate"),
-                address = json.optNullableString("address"),
-                mobileNumber = json.optNullableString("mobileNumber"),
-                organizationName = json.optNullableString("organizationName"),
-                registrationNumber = json.optNullableString("registrationNumber"),
-                rawText = rawText,
-                isVerified = false,
-                updatedAt = System.currentTimeMillis()
+                issuingAuthority = json.optNullableString("issuingAuthority"),
+                documentSpecificFields = specificsMap
             )
 
-            val suggestedDisplayName = buildDisplayName(finalDocName, ownerName)
+            // Stage 5: Reconcile AI + Local Deterministic Parser (recovers any blank fields present in OCR)
+            val reconciled = DeterministicDocumentParser.reconcileWithAi(
+                ai = aiMeta,
+                localFallback = localFallback,
+                rawText = rawText,
+                stageSummary = buildString {
+                    append("6-Stage OCR (${pageSegments.size.coerceAtLeast(1)} page")
+                    if (pageSegments.size > 1) append("s")
+                    append(")")
+                    if (appliedRotationDeg != 0) append(" • Rotated $appliedRotationDeg°")
+                    if (contrastEnhanced) append(" • Contrast Enhanced")
+                }
+            )
+
+            val finalEntity = reconciled.toDocumentExtractionEntity(rawText = rawText, isVerified = false)
+            val suggestedDisplayName = buildDisplayName(reconciled.documentName, reconciled.ownerName)
             val detectedCategory = DskCategories.classifyFromOcrContent(
                 rawText = rawText,
-                detectedDocName = finalDocName,
-                detectedDocType = finalDocType,
+                detectedDocName = reconciled.documentName,
+                detectedDocType = reconciled.documentType,
                 originalFilename = originalFilename,
                 mimeType = mime,
                 currentCategoryId = baseCategory
             )
-            DocumentOcrResult.Success(extraction, suggestedDisplayName, detectedCategory)
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "AI Document analysis timed out", e)
-            buildFallbackResult(extractedTextBuilder.toString().trim(), originalFilename, mime, "OCR parsing timed out. Extracted text preserved for manual verification.")
+
+            DocumentOcrResult.Success(
+                extraction = finalEntity,
+                extendedMetadata = reconciled,
+                suggestedDisplayName = suggestedDisplayName,
+                detectedCategoryId = detectedCategory
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "AI Document analysis fallback", e)
-            buildFallbackResult(
-                extractedTextBuilder.toString().trim(),
-                originalFilename,
-                mime,
-                e.localizedMessage ?: "AI extraction unavailable offline; local OCR text preserved."
-            )
+            Log.e(TAG, "Document OCR failed, attempting deterministic recovery", e)
+            val rawText = extractedTextBuilder.toString().trim()
+            if (rawText.isBlank()) {
+                DocumentOcrResult.Error("Could not extract readable text from $originalFilename. File saved safely.")
+            } else {
+                val baseCategory = DskCategories.classifyFile(originalFilename, mime)
+                val localFallback = DeterministicDocumentParser.parseLocal(
+                    fileId = fileId,
+                    rawText = rawText,
+                    originalFilename = originalFilename,
+                    mimeType = mime,
+                    pages = pageSegments,
+                    orientationAppliedDeg = appliedRotationDeg,
+                    enhancedContrastApplied = contrastEnhanced
+                )
+                buildLocalRecoverySuccess(
+                    fileId = fileId,
+                    localFallback = localFallback,
+                    rawText = rawText,
+                    originalFilename = originalFilename,
+                    mime = mime,
+                    baseCategory = baseCategory,
+                    notice = e.localizedMessage ?: "AI extraction fallback — local Hindi+English OCR results recovered."
+                )
+            }
+        } finally {
+            aiBitmaps.forEach { runCatching { if (!it.isRecycled) it.recycle() } }
         }
     }
 
-    private fun buildFallbackResult(
+    private fun buildLocalRecoverySuccess(
+        fileId: String,
+        localFallback: ExtendedOcrMetadata,
         rawText: String,
         originalFilename: String,
         mime: String,
-        fallbackNotice: String
-    ): DocumentOcrResult {
-        val baseCat = DskCategories.classifyFile(originalFilename, mime)
-        if (rawText.isBlank()) {
-            return DocumentOcrResult.Error("Could not extract readable text from $originalFilename. File saved safely — edit details manually if needed.")
-        }
-        val heuristic = detectBasicDocInfo(rawText, originalFilename, mime, baseCat)
-        val localNumber = extractExplicitDocumentNumber(rawText, heuristic.second)
+        baseCategory: String,
+        notice: String
+    ): DocumentOcrResult.Success {
+        val enriched = localFallback.copy(
+            fileId = fileId,
+            stageSummary = "Local Bilingual OCR (${localFallback.pageExtractions.size.coerceAtLeast(1)} page(s)) • Offline Mode"
+        )
+        val finalized = DeterministicDocumentParser.finalizeScoresAndMissing(enriched, rawText)
+        val entity = finalized.toDocumentExtractionEntity(rawText = rawText, isVerified = false)
+        val suggested = buildDisplayName(finalized.documentName, finalized.ownerName)
         val cat = DskCategories.classifyFromOcrContent(
             rawText = rawText,
-            detectedDocName = heuristic.first,
-            detectedDocType = heuristic.second,
+            detectedDocName = finalized.documentName,
+            detectedDocType = finalized.documentType,
             originalFilename = originalFilename,
             mimeType = mime,
-            currentCategoryId = baseCat
+            currentCategoryId = baseCategory
         )
-        return DocumentOcrResult.PartialRawTextOnly(
-            rawText = rawText,
-            errorMessage = fallbackNotice,
-            detectedDocumentName = heuristic.first,
-            detectedDocumentType = heuristic.second,
-            detectedDocumentNumber = localNumber,
-            detectedCategoryId = cat
+        return DocumentOcrResult.Success(
+            extraction = entity,
+            extendedMetadata = finalized,
+            suggestedDisplayName = suggested,
+            detectedCategoryId = cat,
+            notice = notice
         )
     }
 
@@ -381,18 +511,97 @@ class DocumentOcrEngine(private val context: Context) {
         }
     }
 
-    private suspend fun recognizeBitmapText(bitmap: Bitmap): String {
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    /**
+     * Runs both Latin and Devanagari (Hindi) ML Kit recognizers and merges unique lines cleanly.
+     */
+    private suspend fun recognizeBilingualText(bitmap: Bitmap): String {
         val inputImage = InputImage.fromBitmap(bitmap, 0)
-        return suspendCancellableCoroutine { cont ->
-            recognizer.process(inputImage)
-                .addOnSuccessListener { visionText ->
-                    cont.resume(visionText.text)
-                }
-                .addOnFailureListener { err ->
-                    cont.resumeWithException(err)
-                }
+        val latinText = runRecognizer(latinRecognizer, inputImage)
+        val hindiText = runRecognizer(devanagariRecognizer, inputImage)
+
+        val merged = linkedSetOf<String>()
+        latinText.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { merged.add(it) }
+        hindiText.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { line ->
+            // Prefer keeping Devanagari lines and non-duplicate English lines recovered by Devanagari engine
+            if (line.any { it in '\u0900'..'\u097F' } || merged.none { it.equals(line, ignoreCase = true) }) {
+                merged.add(line)
+            }
         }
+        return merged.joinToString("\n")
+    }
+
+    private suspend fun runRecognizer(
+        client: com.google.mlkit.vision.text.TextRecognizer,
+        image: InputImage
+    ): String = suspendCancellableCoroutine { cont ->
+        client.process(image)
+            .addOnSuccessListener { visionText -> cont.resume(visionText.text) }
+            .addOnFailureListener { cont.resume("") }
+    }
+
+    /**
+     * Enhances image & auto-detects document orientation across 0 / 90 / 270 / 180 degrees.
+     */
+    private suspend fun detectBestOrientationAndRecognize(rawBitmap: Bitmap): OrientationOcrOutput {
+        val enhanced0 = ImagePreprocessor.enhanceForOcr(rawBitmap)
+        if (rawBitmap !== enhanced0) rawBitmap.recycle()
+
+        val text0 = recognizeBilingualText(enhanced0)
+        val score0 = scoreOcrReadability(text0)
+        if (score0 >= 120) {
+            return OrientationOcrOutput(enhanced0, text0, 0, true)
+        }
+
+        var bestBmp = enhanced0
+        var bestText = text0
+        var bestScore = score0
+        var bestDeg = 0
+
+        for (deg in listOf(90, 270, 180)) {
+            val matrix = Matrix().apply { postRotate(deg.toFloat()) }
+            val rotated = Bitmap.createBitmap(enhanced0, 0, 0, enhanced0.width, enhanced0.height, matrix, true)
+            val txt = recognizeBilingualText(rotated)
+            val sc = scoreOcrReadability(txt)
+            if (sc > bestScore + 12) {
+                if (bestBmp !== enhanced0) bestBmp.recycle()
+                bestBmp = rotated
+                bestText = txt
+                bestScore = sc
+                bestDeg = deg
+            } else {
+                rotated.recycle()
+            }
+        }
+
+        if (bestBmp !== enhanced0) {
+            enhanced0.recycle()
+        }
+        return OrientationOcrOutput(bestBmp, bestText, bestDeg, true)
+    }
+
+    private fun scoreOcrReadability(text: String): Int {
+        if (text.isBlank()) return 0
+        val cleanLetters = text.count { it.isLetterOrDigit() || it in '\u0900'..'\u097F' }
+        val lines = text.lines().count { it.trim().length >= 3 }
+        val cues = listOf(
+            "government", "india", "aadhaar", "income", "tax", "passport", "driving", "licence",
+            "election", "bank", "invoice", "certificate", "name", "dob", "address", "भारत", "आधार", "नाम", "जन्म", "पता"
+        ).count { text.contains(it, ignoreCase = true) }
+        return cleanLetters + (lines * 4) + (cues * 25)
+    }
+
+    private fun scaleForAi(src: Bitmap, maxDim: Int = 1400): Bitmap {
+        val w = src.width
+        val h = src.height
+        val longest = maxOf(w, h)
+        if (longest <= maxDim) return src
+        val ratio = maxDim.toFloat() / longest.toFloat()
+        return Bitmap.createScaledBitmap(
+            src,
+            (w * ratio).toInt().coerceAtLeast(1),
+            (h * ratio).toInt().coerceAtLeast(1),
+            true
+        )
     }
 
     private suspend fun extractVideoFrameText(file: File): Pair<Bitmap?, String> {
@@ -412,11 +621,13 @@ class DocumentOcrEngine(private val context: Context) {
                 val frame = runCatching {
                     retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 }.getOrNull() ?: continue
-                val text = runCatching { recognizeBitmapText(frame) }.getOrDefault("").trim()
+                val enhanced = ImagePreprocessor.enhanceForOcr(frame)
+                val text = runCatching { recognizeBilingualText(enhanced) }.getOrDefault("").trim()
+                if (enhanced !== frame) enhanced.recycle()
                 if (text.isNotBlank()) {
                     val freshLines = text.lines().map { it.trim() }.filter { it.isNotBlank() && seenLines.add(it) }
                     if (freshLines.isNotEmpty()) {
-                        sb.appendLine("--- Video Frame ${idx + 1} ---")
+                        sb.appendLine("--- Page ${idx + 1} ---")
                         freshLines.forEach { sb.appendLine(it) }
                     }
                 }
@@ -434,35 +645,64 @@ class DocumentOcrEngine(private val context: Context) {
         return firstFrame to sb.toString()
     }
 
-    private suspend fun extractPdfPagesAndText(file: File): Pair<Bitmap?, String> {
+    private suspend fun extractPdfPagesAndText(
+        file: File,
+        onPageProgress: (String, Float) -> Unit = { _, _ -> }
+    ): PdfExtractionOutput {
         val sb = StringBuilder()
-        var firstPageBitmap: Bitmap? = null
+        val pages = mutableListOf<PageOcrSegment>()
+        val keptBitmaps = mutableListOf<Bitmap>()
+
         ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
             PdfRenderer(pfd).use { renderer ->
-                val pageCount = renderer.pageCount.coerceAtMost(5)
-                for (i in 0 until pageCount) {
+                val totalPages = renderer.pageCount.coerceAtLeast(0)
+                val scanCount = totalPages.coerceAtMost(MAX_PDF_PAGES_FULL_SCAN)
+                val sampleIndices = when {
+                    scanCount <= 0 -> emptySet()
+                    scanCount <= 3 -> (0 until scanCount).toSet()
+                    else -> setOf(0, 1, scanCount - 1)
+                }
+
+                for (i in 0 until scanCount) {
+                    onPageProgress("SCANNING PAGE ${i + 1}/$scanCount", (i + 1).toFloat() / scanCount.coerceAtLeast(1))
                     renderer.openPage(i).use { page ->
-                        val scale = 2
-                        val width = (page.width * scale).coerceIn(600, 1600)
-                        val height = (page.height * scale).coerceIn(600, 2200)
-                        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                        bitmap.eraseColor(Color.WHITE)
-                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        val pageText = recognizeBitmapText(bitmap)
+                        val scale = 2.2f
+                        val width = (page.width * scale).toInt().coerceIn(720, 1800)
+                        val height = (page.height * scale).toInt().coerceIn(720, 2500)
+                        val rawBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        rawBmp.eraseColor(Color.WHITE)
+                        page.render(rawBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                        val enhanced = ImagePreprocessor.enhanceForOcr(rawBmp)
+                        rawBmp.recycle()
+
+                        val pageText = recognizeBilingualText(enhanced).trim()
                         if (pageText.isNotBlank()) {
                             sb.appendLine("--- Page ${i + 1} ---")
                             sb.appendLine(pageText)
+                            pages.add(
+                                PageOcrSegment(
+                                    pageNumber = i + 1,
+                                    text = pageText,
+                                    detectedHeading = pageText.lines().firstOrNull { it.isNotBlank() }?.take(60),
+                                    confidenceHint = if (pageText.length > 80) "HIGH" else "MEDIUM"
+                                )
+                            )
                         }
-                        if (i == 0) {
-                            firstPageBitmap = bitmap
+                        if (i in sampleIndices) {
+                            keptBitmaps.add(enhanced)
                         } else {
-                            bitmap.recycle()
+                            enhanced.recycle()
                         }
                     }
                 }
             }
         }
-        return firstPageBitmap to sb.toString()
+        return PdfExtractionOutput(
+            representativeBitmaps = keptBitmaps,
+            combinedText = sb.toString(),
+            pages = pages
+        )
     }
 
     private fun extractDocxText(file: File): String {
@@ -549,10 +789,13 @@ class DocumentOcrEngine(private val context: Context) {
 
     private fun extractPptxText(file: File): String {
         val sb = StringBuilder()
+        var slideIdx = 1
         ZipInputStream(file.inputStream().buffered()).use { zip ->
             var entry = zip.nextEntry
             while (entry != null) {
                 if (entry.name.startsWith("ppt/slides/slide") && entry.name.endsWith(".xml")) {
+                    sb.appendLine("--- Page $slideIdx ---")
+                    slideIdx++
                     val parser = Xml.newPullParser()
                     parser.setInput(zip, "UTF-8")
                     var event = parser.eventType
@@ -582,7 +825,7 @@ class DocumentOcrEngine(private val context: Context) {
             .replace("&amp;", "&")
             .replace(Regex("\\s+"), " ")
             .trim()
-            .take(24_000)
+            .take(32_000)
     }
 
     private fun extractLegacyDocPrintableText(file: File): String {
@@ -600,32 +843,7 @@ class DocumentOcrEngine(private val context: Context) {
                 current.clear()
             }
         }
-        return sb.toString().replace(Regex("\\s+"), " ").trim().take(24_000)
-    }
-
-    private fun decodeScaledBitmap(file: File, maxDim: Int): Bitmap? {
-        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(file.absolutePath, opts)
-        if (opts.outWidth <= 0 || opts.outHeight <= 0) return null
-        var sample = 1
-        while (opts.outWidth / sample > maxDim || opts.outHeight / sample > maxDim) {
-            sample *= 2
-        }
-        val loadOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val decoded = BitmapFactory.decodeFile(file.absolutePath, loadOpts) ?: return null
-        val rotation = runCatching {
-            when (ExifInterface(file.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                else -> 0f
-            }
-        }.getOrDefault(0f)
-        if (rotation == 0f) return decoded
-        val matrix = Matrix().apply { postRotate(rotation) }
-        return Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true).also {
-            if (it !== decoded) decoded.recycle()
-        }
+        return sb.toString().replace(Regex("\\s+"), " ").trim().take(32_000)
     }
 
     private fun JSONObject.optNullableString(key: String): String? {
