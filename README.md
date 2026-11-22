@@ -124,5 +124,8 @@ gradle :app:bundleRelease
    git remote add origin https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
    git push -u origin main
    ```
-4. **Release Signing Secrets in GitHub Actions (Optional):**
+4. **Automatic GitHub Actions APK Build (`.github/workflows/build-apk.yml`):**
+   - Every push to `main` (or manual **Run workflow** via **Actions → Build DSK LOCKER Android APK**) runs unit tests and builds `app/build/outputs/apk/debug/app-debug.apk`.
+   - Download the generated APK from the completed workflow run under **Artifacts → `DSK-Locker-APK`**.
+5. **Release Signing Secrets in GitHub Actions (Optional):**
    Add `KEYSTORE_BASE64`, `STORE_PASSWORD`, and `KEY_PASSWORD` as **GitHub Repository Secrets** before running automated release APK/AAB builds.

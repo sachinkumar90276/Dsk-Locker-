@@ -247,7 +247,7 @@ lockerRouter.post(
   requireAuthorizedOwner,
   async (req: AuthenticatedRequest, res: Response) => {
     const uid = req.firebaseUid!;
-    const table = req.params.table;
+    const table = Array.isArray(req.params.table) ? req.params.table[0] : req.params.table;
     const spec = ALLOWED_SYNC_TABLES[table];
     if (!spec) {
       res.status(400).json({ error: "Unsupported table name." });
@@ -293,7 +293,8 @@ lockerRouter.delete(
   requireAuthorizedOwner,
   async (req: AuthenticatedRequest, res: Response) => {
     const uid = req.firebaseUid!;
-    const { table, id } = req.params;
+    const table = Array.isArray(req.params.table) ? req.params.table[0] : req.params.table;
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const spec = ALLOWED_SYNC_TABLES[table];
     if (!spec || spec.pk === "firebase_uid") {
       res.status(400).json({ error: "Invalid delete target." });
