@@ -22,6 +22,7 @@ data class ExtendedOcrMetadata(
     val ownerName: String? = null,
     val fatherName: String? = null,
     val motherName: String? = null,
+    val spouseName: String? = null,
     val dateOfBirth: String? = null,
     val gender: String? = null,
     val documentNumber: String? = null,
@@ -30,6 +31,7 @@ data class ExtendedOcrMetadata(
     val email: String? = null,
     val address: String? = null,
     val village: String? = null,
+    val tehsil: String? = null,
     val city: String? = null,
     val district: String? = null,
     val state: String? = null,
@@ -42,6 +44,7 @@ data class ExtendedOcrMetadata(
     val confidenceScore: Int = 0,
     val confidenceLabel: String = "LOW",
     val fieldConfidences: Map<String, String> = emptyMap(),
+    val fieldConfidenceScores: Map<String, Int> = emptyMap(),
     val needsReviewFields: Set<String> = emptySet(),
     val missingExpectedFields: List<String> = emptyList(),
     val pageExtractions: List<PageOcrSegment> = emptyList(),
@@ -49,11 +52,14 @@ data class ExtendedOcrMetadata(
     val orientationAppliedDeg: Int = 0,
     val enhancedContrastApplied: Boolean = false
 ) {
+    fun scoreForField(key: String): Int = fieldConfidenceScores[key] ?: 0
+
     fun toDocumentExtractionEntity(rawText: String, isVerified: Boolean = false): DocumentExtractionEntity {
         val cleanAuthorityOrOrg = organizationName?.takeIf { it.isNotBlank() }
             ?: issuingAuthority?.takeIf { it.isNotBlank() }
         val composedAddress = address?.takeIf { it.isNotBlank() } ?: listOfNotNull(
             village?.takeIf { it.isNotBlank() },
+            tehsil?.takeIf { it.isNotBlank() }?.let { "Tehsil $it" },
             city?.takeIf { it.isNotBlank() },
             district?.takeIf { it.isNotBlank() },
             state?.takeIf { it.isNotBlank() },
@@ -89,6 +95,7 @@ data class ExtendedOcrMetadata(
         obj.putOpt("ownerName", ownerName)
         obj.putOpt("fatherName", fatherName)
         obj.putOpt("motherName", motherName)
+        obj.putOpt("spouseName", spouseName)
         obj.putOpt("dateOfBirth", dateOfBirth)
         obj.putOpt("gender", gender)
         obj.putOpt("documentNumber", documentNumber)
@@ -97,6 +104,7 @@ data class ExtendedOcrMetadata(
         obj.putOpt("email", email)
         obj.putOpt("address", address)
         obj.putOpt("village", village)
+        obj.putOpt("tehsil", tehsil)
         obj.putOpt("city", city)
         obj.putOpt("district", district)
         obj.putOpt("state", state)
@@ -118,6 +126,10 @@ data class ExtendedOcrMetadata(
         val confObj = JSONObject()
         fieldConfidences.forEach { (k, v) -> confObj.put(k, v) }
         obj.put("fieldConfidences", confObj)
+
+        val scoreObj = JSONObject()
+        fieldConfidenceScores.forEach { (k, v) -> scoreObj.put(k, v) }
+        obj.put("fieldConfidenceScores", scoreObj)
 
         val reviewArr = JSONArray()
         needsReviewFields.forEach { reviewArr.put(it) }
@@ -162,6 +174,14 @@ data class ExtendedOcrMetadata(
                     if (v.isNotBlank()) confs[k] = v
                 }
             }
+            val scores = linkedMapOf<String, Int>()
+            obj.optJSONObject("fieldConfidenceScores")?.let { scObj ->
+                val keys = scObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    scores[k] = scObj.optInt(k, 0).coerceIn(0, 100)
+                }
+            }
             val review = linkedSetOf<String>()
             obj.optJSONArray("needsReviewFields")?.let { arr ->
                 for (i in 0 until arr.length()) {
@@ -195,6 +215,7 @@ data class ExtendedOcrMetadata(
                 ownerName = obj.optNull("ownerName"),
                 fatherName = obj.optNull("fatherName"),
                 motherName = obj.optNull("motherName"),
+                spouseName = obj.optNull("spouseName"),
                 dateOfBirth = obj.optNull("dateOfBirth"),
                 gender = obj.optNull("gender"),
                 documentNumber = obj.optNull("documentNumber"),
@@ -203,6 +224,7 @@ data class ExtendedOcrMetadata(
                 email = obj.optNull("email"),
                 address = obj.optNull("address"),
                 village = obj.optNull("village"),
+                tehsil = obj.optNull("tehsil"),
                 city = obj.optNull("city"),
                 district = obj.optNull("district"),
                 state = obj.optNull("state"),
@@ -215,6 +237,7 @@ data class ExtendedOcrMetadata(
                 confidenceScore = obj.optInt("confidenceScore", 0),
                 confidenceLabel = obj.optString("confidenceLabel", "LOW"),
                 fieldConfidences = confs,
+                fieldConfidenceScores = scores,
                 needsReviewFields = review,
                 missingExpectedFields = missing,
                 pageExtractions = pages,
@@ -237,6 +260,7 @@ object DocumentFieldProfile {
     const val KEY_OWNER_NAME = "ownerName"
     const val KEY_FATHER_NAME = "fatherName"
     const val KEY_MOTHER_NAME = "motherName"
+    const val KEY_SPOUSE_NAME = "spouseName"
     const val KEY_DOB = "dateOfBirth"
     const val KEY_GENDER = "gender"
     const val KEY_DOC_NUMBER = "documentNumber"
@@ -245,6 +269,7 @@ object DocumentFieldProfile {
     const val KEY_EMAIL = "email"
     const val KEY_ADDRESS = "address"
     const val KEY_VILLAGE = "village"
+    const val KEY_TEHSIL = "tehsil"
     const val KEY_CITY = "city"
     const val KEY_DISTRICT = "district"
     const val KEY_STATE = "state"
@@ -256,10 +281,10 @@ object DocumentFieldProfile {
 
     val allFieldKeys = listOf(
         KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
-        KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_DOB, KEY_GENDER,
-        KEY_MOBILE, KEY_EMAIL, KEY_ADDRESS, KEY_VILLAGE, KEY_CITY, KEY_DISTRICT,
-        KEY_STATE, KEY_PIN_CODE, KEY_ORG_NAME, KEY_ISSUE_DATE, KEY_EXPIRY_DATE,
-        KEY_ISSUING_AUTH
+        KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_SPOUSE_NAME,
+        KEY_DOB, KEY_GENDER, KEY_MOBILE, KEY_EMAIL, KEY_ADDRESS,
+        KEY_VILLAGE, KEY_TEHSIL, KEY_CITY, KEY_DISTRICT, KEY_STATE, KEY_PIN_CODE,
+        KEY_ORG_NAME, KEY_ISSUE_DATE, KEY_EXPIRY_DATE, KEY_ISSUING_AUTH
     )
 
     fun labelForKey(key: String): String = when (key) {
@@ -268,29 +293,27 @@ object DocumentFieldProfile {
         KEY_OWNER_NAME -> "Owner / Holder Name"
         KEY_FATHER_NAME -> "Father's Name"
         KEY_MOTHER_NAME -> "Mother's Name"
+        KEY_SPOUSE_NAME -> "Husband / Wife Name"
         KEY_DOB -> "Date of Birth"
         KEY_GENDER -> "Gender"
-        KEY_DOC_NUMBER -> "Document Number"
-        KEY_REG_NUMBER -> "Registration Number"
+        KEY_DOC_NUMBER -> "Document / Certificate No"
+        KEY_REG_NUMBER -> "Registration / Application No"
         KEY_MOBILE -> "Mobile Number"
         KEY_EMAIL -> "Email"
         KEY_ADDRESS -> "Address"
         KEY_VILLAGE -> "Village"
+        KEY_TEHSIL -> "Tehsil / Block"
         KEY_CITY -> "City"
         KEY_DISTRICT -> "District"
         KEY_STATE -> "State"
         KEY_PIN_CODE -> "PIN Code"
-        KEY_ORG_NAME -> "Organization Name"
+        KEY_ORG_NAME -> "Organization / Dept"
         KEY_ISSUE_DATE -> "Issue Date"
         KEY_EXPIRY_DATE -> "Expiry Date"
         KEY_ISSUING_AUTH -> "Issuing Authority"
         else -> key
     }
 
-    /**
-     * Dynamically prioritizes relevant fields for the recognized document type
-     * so irrelevant fields are omitted from the primary view.
-     */
     fun relevantKeysForType(documentType: String?): List<String> {
         val t = documentType.orEmpty().lowercase()
         return when {
@@ -304,10 +327,18 @@ object DocumentFieldProfile {
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_OWNER_NAME,
                 KEY_FATHER_NAME, KEY_DOB, KEY_ISSUING_AUTH
             )
+            t.contains("residence") || t.contains("domicile") || t.contains("caste") ||
+                t.contains("income") || t.contains("birth") || t.contains("death") ||
+                t.contains("marriage") || t.contains("ration") -> listOf(
+                KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
+                KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_SPOUSE_NAME,
+                KEY_DOB, KEY_GENDER, KEY_ADDRESS, KEY_VILLAGE, KEY_TEHSIL,
+                KEY_DISTRICT, KEY_STATE, KEY_PIN_CODE, KEY_ISSUE_DATE, KEY_EXPIRY_DATE, KEY_ISSUING_AUTH
+            )
             t.contains("voter") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_OWNER_NAME,
-                KEY_FATHER_NAME, KEY_DOB, KEY_GENDER, KEY_ADDRESS,
-                KEY_CITY, KEY_DISTRICT, KEY_STATE, KEY_PIN_CODE, KEY_ISSUING_AUTH
+                KEY_FATHER_NAME, KEY_SPOUSE_NAME, KEY_DOB, KEY_GENDER, KEY_ADDRESS,
+                KEY_TEHSIL, KEY_CITY, KEY_DISTRICT, KEY_STATE, KEY_PIN_CODE, KEY_ISSUING_AUTH
             )
             t.contains("driving") || t.contains("licence") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_OWNER_NAME,
@@ -316,8 +347,8 @@ object DocumentFieldProfile {
             )
             t.contains("passport") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
-                KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_DOB, KEY_GENDER,
-                KEY_ADDRESS, KEY_CITY, KEY_STATE, KEY_PIN_CODE,
+                KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_SPOUSE_NAME,
+                KEY_DOB, KEY_GENDER, KEY_ADDRESS, KEY_CITY, KEY_STATE, KEY_PIN_CODE,
                 KEY_ISSUE_DATE, KEY_EXPIRY_DATE, KEY_ISSUING_AUTH
             )
             t.contains("bank") -> listOf(
@@ -328,13 +359,22 @@ object DocumentFieldProfile {
             t.contains("insurance") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
                 KEY_OWNER_NAME, KEY_DOB, KEY_MOBILE, KEY_EMAIL, KEY_ORG_NAME,
-                KEY_ADDRESS, KEY_CITY, KEY_STATE, KEY_PIN_CODE,
-                KEY_ISSUE_DATE, KEY_EXPIRY_DATE
+                KEY_ADDRESS, KEY_CITY, KEY_STATE, KEY_PIN_CODE, KEY_ISSUE_DATE, KEY_EXPIRY_DATE
             )
-            t.contains("certificate") || t.contains("marksheet") -> listOf(
+            t.contains("mark sheet") || t.contains("educational") || t.contains("certificate") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_REG_NUMBER, KEY_DOC_NUMBER,
                 KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_DOB,
                 KEY_ORG_NAME, KEY_ISSUE_DATE, KEY_ISSUING_AUTH
+            )
+            t.contains("land") || t.contains("government order") || t.contains("legal") -> listOf(
+                KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
+                KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_ADDRESS, KEY_VILLAGE, KEY_TEHSIL,
+                KEY_DISTRICT, KEY_STATE, KEY_ORG_NAME, KEY_ISSUE_DATE, KEY_ISSUING_AUTH
+            )
+            t.contains("medical") || t.contains("employment") || t.contains("application") || t.contains("identity") -> listOf(
+                KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
+                KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_DOB, KEY_GENDER, KEY_MOBILE, KEY_EMAIL,
+                KEY_ADDRESS, KEY_ORG_NAME, KEY_ISSUE_DATE, KEY_EXPIRY_DATE, KEY_ISSUING_AUTH
             )
             t.contains("resume") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_OWNER_NAME, KEY_MOBILE, KEY_EMAIL,
@@ -343,8 +383,7 @@ object DocumentFieldProfile {
             t.contains("bill") || t.contains("invoice") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_DOC_NUMBER, KEY_REG_NUMBER,
                 KEY_OWNER_NAME, KEY_ORG_NAME, KEY_MOBILE, KEY_EMAIL,
-                KEY_ADDRESS, KEY_CITY, KEY_STATE, KEY_PIN_CODE,
-                KEY_ISSUE_DATE, KEY_EXPIRY_DATE
+                KEY_ADDRESS, KEY_CITY, KEY_STATE, KEY_PIN_CODE, KEY_ISSUE_DATE, KEY_EXPIRY_DATE
             )
             t.contains("photo") -> listOf(
                 KEY_DOC_NAME, KEY_DOC_TYPE, KEY_OWNER_NAME, KEY_CITY, KEY_STATE
@@ -358,15 +397,20 @@ object DocumentFieldProfile {
         return when {
             t.contains("aadhaar") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_DOB, KEY_GENDER, KEY_ADDRESS, KEY_PIN_CODE)
             t.contains("pan") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_DOB)
+            t.contains("residence") || t.contains("domicile") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_DISTRICT, KEY_STATE, KEY_ISSUE_DATE, KEY_ISSUING_AUTH)
+            t.contains("caste") || t.contains("income") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_DISTRICT, KEY_ISSUE_DATE, KEY_ISSUING_AUTH)
+            t.contains("birth") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_DOB, KEY_FATHER_NAME, KEY_MOTHER_NAME, KEY_ISSUE_DATE)
+            t.contains("death") || t.contains("marriage") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_ISSUE_DATE, KEY_ISSUING_AUTH)
+            t.contains("ration") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_ADDRESS, KEY_DISTRICT)
             t.contains("voter") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_FATHER_NAME, KEY_GENDER)
             t.contains("driving") || t.contains("licence") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_DOB, KEY_ISSUE_DATE, KEY_EXPIRY_DATE)
             t.contains("passport") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_DOB, KEY_GENDER, KEY_ISSUE_DATE, KEY_EXPIRY_DATE)
             t.contains("bank") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_ORG_NAME)
             t.contains("insurance") -> listOf(KEY_DOC_NUMBER, KEY_OWNER_NAME, KEY_ORG_NAME, KEY_EXPIRY_DATE)
-            t.contains("certificate") -> listOf(KEY_OWNER_NAME, KEY_REG_NUMBER, KEY_ORG_NAME, KEY_ISSUE_DATE)
+            t.contains("mark sheet") || t.contains("educational") || t.contains("certificate") -> listOf(KEY_OWNER_NAME, KEY_REG_NUMBER, KEY_ORG_NAME, KEY_ISSUE_DATE)
             t.contains("bill") || t.contains("invoice") -> listOf(KEY_DOC_NUMBER, KEY_ORG_NAME, KEY_ISSUE_DATE)
             t.contains("photo") -> emptyList()
-            else -> listOf(KEY_DOC_TYPE, KEY_OWNER_NAME, KEY_DOC_NUMBER)
+            else -> listOf(KEY_DOC_TYPE, KEY_OWNER_NAME)
         }
     }
 }

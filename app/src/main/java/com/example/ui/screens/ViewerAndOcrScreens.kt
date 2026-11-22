@@ -612,12 +612,14 @@ private fun DocumentOcrDetailsPanel(
     var ownerName by remember(metaKey) { mutableStateOf(extendedMeta.ownerName ?: base.ownerName.orEmpty()) }
     var fatherName by remember(metaKey) { mutableStateOf(extendedMeta.fatherName ?: base.fatherName.orEmpty()) }
     var motherName by remember(metaKey) { mutableStateOf(extendedMeta.motherName ?: base.motherName.orEmpty()) }
+    var spouseName by remember(metaKey) { mutableStateOf(extendedMeta.spouseName.orEmpty()) }
     var dob by remember(metaKey) { mutableStateOf(extendedMeta.dateOfBirth ?: base.dateOfBirth.orEmpty()) }
     var gender by remember(metaKey) { mutableStateOf(extendedMeta.gender.orEmpty()) }
     var mobileNumber by remember(metaKey) { mutableStateOf(extendedMeta.mobileNumber ?: base.mobileNumber.orEmpty()) }
     var email by remember(metaKey) { mutableStateOf(extendedMeta.email.orEmpty()) }
     var address by remember(metaKey) { mutableStateOf(extendedMeta.address ?: base.address.orEmpty()) }
     var village by remember(metaKey) { mutableStateOf(extendedMeta.village.orEmpty()) }
+    var tehsil by remember(metaKey) { mutableStateOf(extendedMeta.tehsil.orEmpty()) }
     var city by remember(metaKey) { mutableStateOf(extendedMeta.city.orEmpty()) }
     var district by remember(metaKey) { mutableStateOf(extendedMeta.district.orEmpty()) }
     var state by remember(metaKey) { mutableStateOf(extendedMeta.state.orEmpty()) }
@@ -671,12 +673,14 @@ private fun DocumentOcrDetailsPanel(
         DocumentFieldProfile.KEY_OWNER_NAME -> ownerName
         DocumentFieldProfile.KEY_FATHER_NAME -> fatherName
         DocumentFieldProfile.KEY_MOTHER_NAME -> motherName
+        DocumentFieldProfile.KEY_SPOUSE_NAME -> spouseName
         DocumentFieldProfile.KEY_DOB -> dob
         DocumentFieldProfile.KEY_GENDER -> gender
         DocumentFieldProfile.KEY_MOBILE -> mobileNumber
         DocumentFieldProfile.KEY_EMAIL -> email
         DocumentFieldProfile.KEY_ADDRESS -> address
         DocumentFieldProfile.KEY_VILLAGE -> village
+        DocumentFieldProfile.KEY_TEHSIL -> tehsil
         DocumentFieldProfile.KEY_CITY -> city
         DocumentFieldProfile.KEY_DISTRICT -> district
         DocumentFieldProfile.KEY_STATE -> state
@@ -697,12 +701,14 @@ private fun DocumentOcrDetailsPanel(
             DocumentFieldProfile.KEY_OWNER_NAME -> ownerName = value
             DocumentFieldProfile.KEY_FATHER_NAME -> fatherName = value
             DocumentFieldProfile.KEY_MOTHER_NAME -> motherName = value
+            DocumentFieldProfile.KEY_SPOUSE_NAME -> spouseName = value
             DocumentFieldProfile.KEY_DOB -> dob = value
             DocumentFieldProfile.KEY_GENDER -> gender = value
             DocumentFieldProfile.KEY_MOBILE -> mobileNumber = value
             DocumentFieldProfile.KEY_EMAIL -> email = value
             DocumentFieldProfile.KEY_ADDRESS -> address = value
             DocumentFieldProfile.KEY_VILLAGE -> village = value
+            DocumentFieldProfile.KEY_TEHSIL -> tehsil = value
             DocumentFieldProfile.KEY_CITY -> city = value
             DocumentFieldProfile.KEY_DISTRICT -> district = value
             DocumentFieldProfile.KEY_STATE -> state = value
@@ -714,7 +720,9 @@ private fun DocumentOcrDetailsPanel(
         }
     }
 
-    val visibleKeys = remember(docType, showAllFields, metaKey, docName, docNumber, ownerName, address, mobileNumber, email, orgName) {
+    val visibleKeys = remember(
+        docType, showAllFields, metaKey, docName, docNumber, ownerName, spouseName, tehsil, address, mobileNumber, email, orgName
+    ) {
         if (showAllFields) {
             DocumentFieldProfile.allFieldKeys
         } else {
@@ -948,13 +956,20 @@ private fun DocumentOcrDetailsPanel(
                         listOf(
                             "Aadhaar Card",
                             "PAN Card",
+                            "Residence Certificate",
+                            "Caste Certificate",
+                            "Income Certificate",
+                            "Birth Certificate",
                             "Passport",
                             "Driving Licence",
                             "Voter ID",
+                            "Ration Card",
+                            "Mark Sheet",
                             "Bank Document",
                             "Insurance Document",
                             "Certificate",
                             "Bill / Invoice",
+                            "Generic Document",
                             "Resume",
                             "Office Document",
                             "Personal Photograph",
@@ -979,6 +994,7 @@ private fun DocumentOcrDetailsPanel(
                     OcrField(
                         label = DocumentFieldProfile.labelForKey(key),
                         value = currentValueForKey(key),
+                        fieldScore = if (hasExistingOcr || extendedMeta.confidenceScore > 0) extendedMeta.scoreForField(key) else null,
                         needsReview = key in extendedMeta.needsReviewFields,
                         multiline = key == DocumentFieldProfile.KEY_ADDRESS,
                         onChange = { updateValueForKey(key, it) }
@@ -993,6 +1009,7 @@ private fun DocumentOcrDetailsPanel(
                         OcrField(
                             label = extraKey,
                             value = specificValues[extraKey].orEmpty(),
+                            fieldScore = if (specificValues[extraKey].isNullOrBlank()) 0 else 86,
                             needsReview = false,
                             multiline = false,
                             onChange = { specificValues[extraKey] = it }
@@ -1023,6 +1040,7 @@ private fun DocumentOcrDetailsPanel(
                             ownerName = ownerName.trim().takeIf { it.isNotBlank() },
                             fatherName = fatherName.trim().takeIf { it.isNotBlank() },
                             motherName = motherName.trim().takeIf { it.isNotBlank() },
+                            spouseName = spouseName.trim().takeIf { it.isNotBlank() },
                             dateOfBirth = dob.trim().takeIf { it.isNotBlank() },
                             gender = gender.trim().takeIf { it.isNotBlank() },
                             documentNumber = docNumber.trim().takeIf { it.isNotBlank() },
@@ -1031,6 +1049,7 @@ private fun DocumentOcrDetailsPanel(
                             email = email.trim().takeIf { it.isNotBlank() },
                             address = address.trim().takeIf { it.isNotBlank() },
                             village = village.trim().takeIf { it.isNotBlank() },
+                            tehsil = tehsil.trim().takeIf { it.isNotBlank() },
                             city = city.trim().takeIf { it.isNotBlank() },
                             district = district.trim().takeIf { it.isNotBlank() },
                             state = state.trim().takeIf { it.isNotBlank() },
@@ -1153,16 +1172,30 @@ private fun DocumentOcrDetailsPanel(
 private fun OcrField(
     label: String,
     value: String,
+    fieldScore: Int? = null,
     needsReview: Boolean = false,
     multiline: Boolean = false,
     onChange: (String) -> Unit
 ) {
+    val displayScore = when {
+        value.isBlank() && fieldScore != null -> 0
+        else -> fieldScore
+    }
     OutlinedTextField(
         value = value,
         onValueChange = onChange,
         label = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(label)
+                if (displayScore != null) {
+                    val scoreColor = when {
+                        displayScore == 0 -> CrimsonAlert
+                        displayScore >= 85 -> EmeraldSync
+                        else -> AmberPending
+                    }
+                    val suffix = if (displayScore == 0) "0% (Not Detected)" else "$displayScore%"
+                    Text("• $suffix", color = scoreColor, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
                 if (needsReview) {
                     Text("• Needs Review", color = AmberPending, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 }

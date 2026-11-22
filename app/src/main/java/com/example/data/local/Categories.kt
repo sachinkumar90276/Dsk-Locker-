@@ -134,12 +134,13 @@ object DskCategories {
         originalFilename: String = "",
         mimeType: String = ""
     ): String? {
-        val ocrCombined = listOfNotNull(detectedDocName, detectedDocType, rawText.take(6000))
+        val ocrCombined = listOfNotNull(detectedDocName, detectedDocType, rawText.take(8000))
             .joinToString(" ")
             .lowercase()
 
         if (ocrCombined.isNotBlank()) {
             when {
+                // Government Identity Cards
                 ocrCombined.contains("aadhaar") || ocrCombined.contains("aadhar") || ocrCombined.contains("uidai") ||
                     ocrCombined.contains("unique identification authority") ||
                     ocrCombined.contains("आधार") || ocrCombined.contains("विशिष्ट पहचान") -> return "Aadhaar Card"
@@ -166,6 +167,53 @@ object DskCategories {
                         ocrCombined.contains("p<")) ->
                     return "Passport"
 
+                // Indian Government & Civil Certificates (Hindi + English)
+                ocrCombined.contains("निवास प्रमाण") || ocrCombined.contains("मूल निवास") ||
+                    ocrCombined.contains("residence certificate") || ocrCombined.contains("domicile certificate") ||
+                    ocrCombined.contains("permanent resident certificate") || ocrCombined.contains("niwas praman") ||
+                    ocrCombined.contains("nivasa praman") ->
+                    return "Residence Certificate"
+
+                ocrCombined.contains("जाति प्रमाण") || ocrCombined.contains("caste certificate") ||
+                    ocrCombined.contains("jati praman") ||
+                    (ocrCombined.contains("scheduled caste") || ocrCombined.contains("other backward class")) && ocrCombined.contains("certificate") ->
+                    return "Caste Certificate"
+
+                ocrCombined.contains("आय प्रमाण") || ocrCombined.contains("income certificate") ||
+                    ocrCombined.contains("aay praman") ->
+                    return "Income Certificate"
+
+                ocrCombined.contains("जन्म प्रमाण") || ocrCombined.contains("birth certificate") ||
+                    ocrCombined.contains("registrar of births") || ocrCombined.contains("certificate of birth") ->
+                    return "Birth Certificate"
+
+                ocrCombined.contains("मृत्यु प्रमाण") || ocrCombined.contains("death certificate") ||
+                    ocrCombined.contains("certificate of death") ->
+                    return "Death Certificate"
+
+                ocrCombined.contains("विवाह प्रमाण") || ocrCombined.contains("marriage certificate") ||
+                    ocrCombined.contains("registration of marriage") ->
+                    return "Marriage Certificate"
+
+                ocrCombined.contains("राशन कार्ड") || ocrCombined.contains("ration card") ||
+                    ocrCombined.contains("अन्त्योदय") || ocrCombined.contains("patra grihasthi") ||
+                    (ocrCombined.contains("nfsa") && ocrCombined.contains("card")) ->
+                    return "Ration Card"
+
+                ocrCombined.contains("खतौनी") || ocrCombined.contains("खसरा") || ocrCombined.contains("जमाबंदी") ||
+                    ocrCombined.contains("भूलेख") || ocrCombined.contains("sale deed") || ocrCombined.contains("jamabandi") ||
+                    ocrCombined.contains("land record") || ocrCombined.contains("registry") && ocrCombined.contains("property") ->
+                    return "Land Document"
+
+                ocrCombined.contains("शासनादेश") || ocrCombined.contains("कार्यालय ज्ञाप") || ocrCombined.contains("अधिसूचना") ||
+                    ocrCombined.contains("government order") || ocrCombined.contains("office memorandum") ||
+                    ocrCombined.contains("gazette notification") ->
+                    return "Government Order"
+
+                ocrCombined.contains("marksheet") || ocrCombined.contains("mark sheet") || ocrCombined.contains("अंकसूची") ||
+                    ocrCombined.contains("grade sheet") || ocrCombined.contains("transcript") ->
+                    return "Mark Sheet"
+
                 ocrCombined.contains("curriculum vitae") || ocrCombined.contains("resume") ||
                     (ocrCombined.contains("experience") && ocrCombined.contains("education") && ocrCombined.contains("skills")) ->
                     return "Resume"
@@ -180,11 +228,32 @@ object DskCategories {
                     (ocrCombined.contains("bank") && (ocrCombined.contains("account no") || ocrCombined.contains("account number") || ocrCombined.contains("branch"))) ->
                     return "Bank Document"
 
-                ocrCombined.contains("certificate") || ocrCombined.contains("marksheet") ||
-                    ocrCombined.contains("university") || ocrCombined.contains("diploma") ||
-                    ocrCombined.contains("board of secondary") || ocrCombined.contains("grade sheet") ||
-                    ocrCombined.contains("प्रमाण पत्र") || ocrCombined.contains("अंकसूची") ->
-                    return "Certificate"
+                ocrCombined.contains("offer letter") || ocrCombined.contains("appointment letter") ||
+                    ocrCombined.contains("experience letter") || ocrCombined.contains("salary slip") ||
+                    ocrCombined.contains("payslip") || ocrCombined.contains("relieving letter") ->
+                    return "Employment Document"
+
+                ocrCombined.contains("prescription") || ocrCombined.contains("discharge summary") ||
+                    ocrCombined.contains("pathology") || ocrCombined.contains("diagnostic") ||
+                    ocrCombined.contains("medical report") || ocrCombined.contains("चिकित्सा") ->
+                    return "Medical Document"
+
+                ocrCombined.contains("affidavit") || ocrCombined.contains("शपथ पत्र") ||
+                    ocrCombined.contains("power of attorney") || ocrCombined.contains("legal notice") ||
+                    ocrCombined.contains("agreement") && ocrCombined.contains("whereas") ->
+                    return "Legal Document"
+
+                ocrCombined.contains("application form") || ocrCombined.contains("आवेदन पत्र") ||
+                    ocrCombined.contains("registration form") ->
+                    return "Application Form"
+
+                ocrCombined.contains("identity card") || ocrCombined.contains("employee id") ||
+                    ocrCombined.contains("student id") || ocrCombined.contains("पहचान पत्र") ->
+                    return "Identity Card"
+
+                ocrCombined.contains("certificate") || ocrCombined.contains("university") || ocrCombined.contains("diploma") ||
+                    ocrCombined.contains("board of secondary") || ocrCombined.contains("प्रमाण पत्र") || ocrCombined.contains("प्रमाण-पत्र") ->
+                    return "Educational Certificate"
 
                 ocrCombined.contains("tax invoice") || ocrCombined.contains("invoice") ||
                     ocrCombined.contains("gstin") || ocrCombined.contains("bill no") ||

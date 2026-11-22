@@ -282,4 +282,224 @@ class AdvancedOcrTest {
         assertNull(photoMeta.documentNumber)
         assertTrue(photoMeta.missingExpectedFields.isEmpty())
     }
+
+    @Test
+    fun `hindi and english residence certificate extracts holder tehsil district authority and verification without role confusion`() {
+        val raw = """
+            उत्तर प्रदेश शासन
+            निवास प्रमाण पत्र (Residence Certificate)
+            ई-डिस्ट्रिक्ट पोर्टल
+            आवेदन क्रमांक: 241560020118945
+            प्रमाण पत्र संख्या: 661241009876
+            जारी करने की तिथि: 18 अगस्त 2024
+            यह प्रमाणित किया जाता है कि प्रिया सिंह पुत्री रमेश सिंह
+            माता का नाम: मीना सिंह
+            पति का नाम: अमित कुमार
+            ग्राम: मोहनपुर
+            तहसील: सदर
+            जिला: लखनऊ
+            राज्य: उत्तर प्रदेश
+            पिन कोड: 226001
+            डिजिटली हस्ताक्षरित: तहसीलदार सदर
+            Verification: https://edistrict.up.gov.in/verify
+        """.trimIndent()
+
+        val meta = DeterministicDocumentParser.parseLocal(
+            fileId = "res-1",
+            rawText = raw,
+            originalFilename = "tehsildar_scan_final.pdf",
+            mimeType = "application/pdf"
+        )
+
+        assertEquals("Residence Certificate", meta.documentType)
+        assertEquals("661241009876", meta.documentNumber)
+        assertEquals("241560020118945", meta.registrationNumber)
+        assertEquals("प्रिया सिंह", meta.ownerName)
+        assertNotEquals("रमेश सिंह", meta.ownerName)
+        assertNotEquals("तहसीलदार सदर", meta.ownerName)
+        assertEquals("रमेश सिंह", meta.fatherName)
+        assertEquals("मीना सिंह", meta.motherName)
+        assertEquals("अमित कुमार", meta.spouseName)
+        assertEquals("मोहनपुर", meta.village)
+        assertEquals("सदर", meta.tehsil)
+        assertEquals("लखनऊ", meta.district)
+        assertEquals("226001", meta.pinCode)
+        assertEquals("2024-08-18", meta.issueDate)
+        assertNotNull(meta.issuingAuthority)
+        assertTrue(meta.issuingAuthority!!.contains("तहसीलदार"))
+        assertTrue(meta.documentSpecificFields["Verification Details"]?.contains("edistrict.up.gov.in") == true)
+    }
+
+    @Test
+    fun `caste income and birth certificates extract domain specific details accurately`() {
+        val casteMeta = DeterministicDocumentParser.parseLocal(
+            fileId = "caste-1",
+            rawText = """
+                GOVERNMENT OF BIHAR
+                CASTE CERTIFICATE
+                Certificate No: BCCCO/2025/448120
+                Application No: BRCCO/2025/1022
+                Applicant Name: Rohit Paswan
+                Father Name: Suresh Paswan
+                Caste / Category: Scheduled Caste (Paswan)
+                Tehsil: Danapur
+                District: Patna
+                State: Bihar
+                Issue Date: 12/03/2025
+                Issuing Authority: Circle Officer Danapur
+            """.trimIndent(),
+            originalFilename = "caste.pdf",
+            mimeType = "application/pdf"
+        )
+        assertEquals("Caste Certificate", casteMeta.documentType)
+        assertEquals("Rohit Paswan", casteMeta.ownerName)
+        assertEquals("Suresh Paswan", casteMeta.fatherName)
+        assertEquals("BCCCO/2025/448120", casteMeta.documentNumber)
+        assertEquals("Danapur", casteMeta.tehsil)
+        assertEquals("Patna", casteMeta.district)
+        assertEquals("Bihar", casteMeta.state)
+        assertEquals("2025-03-12", casteMeta.issueDate)
+
+        val incomeMeta = DeterministicDocumentParser.parseLocal(
+            fileId = "inc-1",
+            rawText = """
+                आय प्रमाण पत्र (Income Certificate)
+                Certificate No: INC-2025-99104
+                Applicant Name: Kavita Verma
+                Father's Name: Harish Verma
+                Annual Income: Rs. 72,000
+                Tehsil: Hazratganj
+                District: Lucknow
+                Issue Date: 05/04/2025
+                Issuing Authority: Tehsildar
+            """.trimIndent(),
+            originalFilename = "income.jpg",
+            mimeType = "image/jpeg"
+        )
+        assertEquals("Income Certificate", incomeMeta.documentType)
+        assertEquals("Kavita Verma", incomeMeta.ownerName)
+        assertEquals("INC-2025-99104", incomeMeta.documentNumber)
+        assertEquals("Rs. 72,000", incomeMeta.documentSpecificFields["Annual Income"])
+
+        val birthMeta = DeterministicDocumentParser.parseLocal(
+            fileId = "birth-1",
+            rawText = """
+                BIRTH CERTIFICATE
+                Certificate No: BC-DEL-2024-7781
+                Name: Aarav Gupta
+                DOB: 19/01/2024
+                Gender: Male
+                Father's Name: Manish Gupta
+                Mother's Name: Pooja Gupta
+                Issue Date: 02/02/2024
+                Issuing Authority: Municipal Corporation Registrar
+            """.trimIndent(),
+            originalFilename = "birth_cert.pdf",
+            mimeType = "application/pdf"
+        )
+        assertEquals("Birth Certificate", birthMeta.documentType)
+        assertEquals("Aarav Gupta", birthMeta.ownerName)
+        assertEquals("2024-01-19", birthMeta.dateOfBirth)
+        assertEquals("Manish Gupta", birthMeta.fatherName)
+        assertEquals("Pooja Gupta", birthMeta.motherName)
+    }
+
+    @Test
+    fun `holder name guard refuses father officer or filename when no valid holder is present`() {
+        val raw = """
+            GOVERNMENT CERTIFICATE
+            Certificate No: CERT-99881
+            Father Name: Mahendra Pratap
+            Tehsildar: Ashok Tiwari
+            Authorized Signatory
+            District: Bhopal
+            Issue Date: 11/02/2025
+        """.trimIndent()
+
+        val meta = DeterministicDocumentParser.parseLocal(
+            fileId = "guard-1",
+            rawText = raw,
+            originalFilename = "IMG_999.jpg",
+            mimeType = "image/jpeg"
+        )
+
+        assertNull(meta.ownerName)
+        assertEquals(0, meta.scoreForField(DocumentFieldProfile.KEY_OWNER_NAME))
+        assertTrue(DocumentFieldProfile.KEY_OWNER_NAME in meta.needsReviewFields)
+    }
+
+    @Test
+    fun `reconcileWithAi rejects hallucinated ai values unsupported by raw ocr and scores each field independently`() {
+        val raw = """
+            RESIDENCE CERTIFICATE
+            Certificate No: RC-2025-1102
+            Applicant Name: Anjali Mishra
+            Father Name: Rajesh Mishra
+            District: Varanasi
+            State: Uttar Pradesh
+            Issue Date: 14/05/2025
+        """.trimIndent()
+
+        val local = DeterministicDocumentParser.parseLocal(
+            fileId = "anti-hallucination",
+            rawText = raw,
+            originalFilename = "doc.jpg",
+            mimeType = "image/jpeg"
+        )
+
+        // Simulated hallucinating AI trying to fabricate ownerName, documentNumber, mobile, and issueDate
+        val hallucinatedAi = ExtendedOcrMetadata(
+            fileId = "anti-hallucination",
+            documentType = "Residence Certificate",
+            ownerName = "John Doe",
+            fatherName = "Rajesh Mishra",
+            documentNumber = "9999 8888 7777",
+            mobileNumber = "9999999999",
+            issueDate = "1999-01-01"
+        )
+
+        val verified = DeterministicDocumentParser.reconcileWithAi(
+            ai = hallucinatedAi,
+            localFallback = local,
+            rawText = raw,
+            stageSummary = "9-Stage Universal OCR",
+            originalFilename = "doc.jpg"
+        )
+
+        // Local grounded values win over fabricated AI guesses; non-existent mobile remains null with 0% confidence
+        assertEquals("Anjali Mishra", verified.ownerName)
+        assertEquals("RC-2025-1102", verified.documentNumber)
+        assertEquals("2025-05-14", verified.issueDate)
+        assertNull(verified.mobileNumber)
+        assertEquals(0, verified.scoreForField(DocumentFieldProfile.KEY_MOBILE))
+        assertEquals(0, verified.scoreForField(DocumentFieldProfile.KEY_MOTHER_NAME))
+        assertTrue(verified.scoreForField(DocumentFieldProfile.KEY_FATHER_NAME) >= 95)
+        assertTrue(DocumentFieldProfile.KEY_MOBILE in verified.needsReviewFields)
+    }
+
+    @Test
+    fun `unknown custom document triggers generic document ocr fallback with dynamic key value extraction`() {
+        val raw = """
+            SOCIETY MAINTENANCE CIRCULAR
+            Ref No: SMC/2026/19
+            Building Block: Tower B
+            Parking Slot: B2-104
+            Issued By: Residents Welfare Association
+            Contact Email: rwa.office@example.org
+            Issue Date: 01/10/2026
+        """.trimIndent()
+
+        val meta = DeterministicDocumentParser.parseLocal(
+            fileId = "gen-1",
+            rawText = raw,
+            originalFilename = "society_notice.jpg",
+            mimeType = "image/jpeg"
+        )
+
+        assertEquals("Generic Document", meta.documentType)
+        assertEquals("2026-10-01", meta.issueDate)
+        assertEquals("rwa.office@example.org", meta.email)
+        assertEquals("Tower B", meta.documentSpecificFields["Building Block"])
+        assertEquals("B2-104", meta.documentSpecificFields["Parking Slot"])
+    }
 }

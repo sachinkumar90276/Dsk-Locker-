@@ -17,6 +17,7 @@ import com.google.firebase.ai.type.Schema
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -91,37 +92,39 @@ class DocumentOcrEngine(private val context: Context) {
     private val extractionSchema by lazy {
         Schema.obj(
             properties = mapOf(
-                "documentName" to Schema.string("Official name of the document (e.g. Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Bank Document, Insurance Document, Certificate, Bill / Invoice, Resume, Office Document)", nullable = true),
-                "documentType" to Schema.string("Category/type: Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Bank Document, Insurance Document, Certificate, Bill / Invoice, Resume, Office Document, Personal Photograph, or Other Document", nullable = true),
-                "documentNumber" to Schema.string("Primary ID / card / account / policy / invoice / certificate number explicitly printed", nullable = true),
-                "registrationNumber" to Schema.string("Separate registration, enrolment, CIF, PRAN, application, or roll number if present", nullable = true),
-                "ownerName" to Schema.string("Full name of the document holder / owner / customer / student", nullable = true),
+                "documentName" to Schema.string("Official document title/name printed on the document (e.g. Aadhaar Card, PAN Card, Residence Certificate, Caste Certificate, Income Certificate, Birth Certificate, Passport, Driving Licence, Voter ID, Ration Card, Mark Sheet, Bank Document, Insurance Document, Generic Document)", nullable = true),
+                "documentType" to Schema.string("Exact document category/type: Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Residence Certificate, Caste Certificate, Income Certificate, Birth Certificate, Death Certificate, Marriage Certificate, Ration Card, Land Document, Government Order, Mark Sheet, Educational Certificate, Bank Document, Insurance Document, Medical Document, Employment Document, Legal Document, Application Form, Identity Card, Bill / Invoice, Resume, Office Document, Generic Document, Personal Photograph, or Other Document", nullable = true),
+                "documentNumber" to Schema.string("Primary ID / certificate / card / account / policy / invoice number explicitly printed", nullable = true),
+                "registrationNumber" to Schema.string("Separate application, registration, enrolment, CIF, PRAN, roll, or file number if printed", nullable = true),
+                "ownerName" to Schema.string("ONLY the explicit Certificate Holder / Applicant / Beneficiary / Cardholder / Student / Customer name. NEVER copy Father, Mother, Spouse, Tehsildar/Officer, Authority, Organization, or filename here. Leave null if unclear.", nullable = true),
                 "fatherName" to Schema.string("Father's name (S/O, D/O, पिता का नाम) if explicitly printed", nullable = true),
                 "motherName" to Schema.string("Mother's name (माता का नाम) if explicitly printed", nullable = true),
+                "spouseName" to Schema.string("Husband / Wife / Spouse name (W/O, H/O, पति/पत्नी का नाम) if explicitly printed", nullable = true),
                 "dateOfBirth" to Schema.string("Date of birth in YYYY-MM-DD (or YYYY if only Year of Birth printed)", nullable = true),
                 "gender" to Schema.string("Gender (Male, Female, or Transgender) if printed", nullable = true),
                 "mobileNumber" to Schema.string("Phone / mobile number if explicitly printed", nullable = true),
                 "email" to Schema.string("Email address if explicitly printed", nullable = true),
-                "address" to Schema.string("Complete postal address printed on document", nullable = true),
-                "village" to Schema.string("Village / VTC / Gram name from address if present", nullable = true),
+                "address" to Schema.string("Complete residential/postal address printed on document", nullable = true),
+                "village" to Schema.string("Village / VTC / Gram / Ward name from address if present", nullable = true),
+                "tehsil" to Schema.string("Tehsil / Taluka / Block / Sub-Division (तहसील / प्रखण्ड) name if present", nullable = true),
                 "city" to Schema.string("City or town name if present", nullable = true),
-                "district" to Schema.string("District name if present", nullable = true),
+                "district" to Schema.string("District / Janpad (जिला) name if present", nullable = true),
                 "state" to Schema.string("State or UT name if present", nullable = true),
                 "pinCode" to Schema.string("6-digit postal PIN code if present", nullable = true),
-                "organizationName" to Schema.string("Bank, insurer, university, board, school, company, or vendor name", nullable = true),
+                "organizationName" to Schema.string("Issuing department, e-District portal, bank, insurer, university, board, school, company, or vendor name", nullable = true),
                 "issueDate" to Schema.string("Issue / statement / invoice / bill date in YYYY-MM-DD", nullable = true),
                 "expiryDate" to Schema.string("Expiry / valid till / due / maturity date in YYYY-MM-DD", nullable = true),
-                "issuingAuthority" to Schema.string("Issuing authority, RTO, ministry, or signer authority if printed", nullable = true),
+                "issuingAuthority" to Schema.string("Issuing authority / officer / signer designation (e.g. Tehsildar, SDM, District Magistrate, RTO, तहसीलदार) if printed", nullable = true),
                 "specificDetails" to Schema.array(
                     specificItemSchema,
-                    description = "Any important document-specific fields not in standard keys (IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Place of Birth, Policy Plan, Nominee, Sum Assured, GSTIN, Total Amount, CGPA, Course)",
+                    description = "Any important document-specific fields not in standard keys (Verification URL, Digitally Signed By, Caste Category, Annual Income, Khasra No, IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Place of Birth, Policy Plan, Nominee, Sum Assured, GSTIN, Total Amount, Roll No, CGPA)",
                     nullable = true
                 )
             ),
             optionalProperties = listOf(
                 "documentName", "documentType", "documentNumber", "registrationNumber",
-                "ownerName", "fatherName", "motherName", "dateOfBirth", "gender",
-                "mobileNumber", "email", "address", "village", "city", "district",
+                "ownerName", "fatherName", "motherName", "spouseName", "dateOfBirth", "gender",
+                "mobileNumber", "email", "address", "village", "tehsil", "city", "district",
                 "state", "pinCode", "organizationName", "issueDate", "expiryDate",
                 "issuingAuthority", "specificDetails"
             )
@@ -286,17 +289,17 @@ class DocumentOcrEngine(private val context: Context) {
 
             // Stage 4: Structured AI Extraction with Representative Page Visuals + Full Text
             val promptText = buildString {
-                appendLine("You are an expert bilingual (English + Hindi/Devanagari) Indian & international document OCR data extractor.")
-                appendLine("Analyze ALL attached page images and the complete multi-page OCR text carefully.")
-                appendLine("STRICT EXTRACTION RULES:")
-                appendLine("1. Extract ONLY fields that are explicitly and clearly present across ANY page, column, table, or footer.")
-                appendLine("2. NEVER invent, assume, or hallucinate missing fields. Leave absent fields null.")
-                appendLine("3. Support both Hindi and English labels (e.g. नाम/Name, पिता/Father, माता/Mother, जन्म तिथि/DOB, पता/Address, जिला/District, ग्राम/Village).")
-                appendLine("4. Classify documentType concisely (Aadhaar Card, PAN Card, Passport, Driving Licence, Voter ID, Bank Document, Insurance Document, Certificate, Bill / Invoice, Resume, Office Document, Personal Photograph, or Other Document).")
-                appendLine("5. Normalize dateOfBirth, issueDate, and expiryDate to YYYY-MM-DD whenever day, month, and year are readable.")
-                appendLine("6. Split address components into village, city, district, state, and pinCode wherever present in addition to full address.")
-                appendLine("7. Put document-specific extras (IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Place of Birth, Passport File No, Policy Plan, Nominee, Sum Assured, GSTIN, Total Amount, Roll No, CGPA) into specificDetails.")
-                appendLine("Original filename: $originalFilename")
+                appendLine("You are an expert universal bilingual (English + Hindi/Devanagari) document OCR extraction engine.")
+                appendLine("Analyze ALL attached page images and the complete multi-page OCR text carefully across headers, tables, paragraphs, stamps, and footers.")
+                appendLine("STRICT ANTI-HALLUCINATION & ACCURACY RULES:")
+                appendLine("1. Extract ONLY values explicitly and visibly printed in the document. NEVER guess, assume, infer from filename, or fabricate missing fields. Leave absent/unreadable fields null.")
+                appendLine("2. OWNER / HOLDER NAME GUARD (CRITICAL): Put ONLY the Certificate Holder / Applicant / Beneficiary / Cardholder / Student / Customer name in ownerName. NEVER put Father's Name, Mother's Name, Husband/Wife Name, Tehsildar/Officer/Signatory name, Issuing Authority, Organization Name, Address, or Filename into ownerName.")
+                appendLine("3. Support ANY document type universally — including Residence/Domicile Certificate (निवास प्रमाण पत्र / मूल निवास प्रमाण पत्र), Caste Certificate (जाति प्रमाण पत्र), Income Certificate (आय प्रमाण पत्र), Birth/Death/Marriage Certificates, Ration Card, Land Records, Government Orders, Mark Sheets, Aadhaar, PAN, Passport, Driving Licence, Voter ID, Bank/Insurance/Medical/Employment/Legal documents, Application Forms, Bills/Invoices, or Generic Document for custom/uncommon documents.")
+                appendLine("4. Preserve Hindi/Devanagari spelling verbatim when printed in Hindi (e.g. ग्राम, तहसील, जिला, नाम, पिता, माता). Do NOT translate printed names.")
+                appendLine("5. Normalize dateOfBirth, issueDate, and expiryDate to YYYY-MM-DD whenever day, month, and year are explicitly readable (including Hindi months).")
+                appendLine("6. Split address components into village, tehsil, city, district, state, and pinCode wherever present in addition to full address.")
+                appendLine("7. Put document-specific extras (Verification Details/URL, Digitally Signed By, Caste Category, Annual Income, Khasra/Khatauni No, IFSC Code, Branch, VID, Blood Group, Vehicle Class, Nationality, Policy Plan, Nominee, Sum Assured, GSTIN, Total Amount, Roll No, CGPA) into specificDetails.")
+                appendLine("Original filename (for reference ONLY — never treat as ownerName): $originalFilename")
                 if (rawText.isNotBlank()) {
                     appendLine("\n--- COMPLETE DOCUMENT OCR TEXT (${pageSegments.size.coerceAtLeast(1)} PAGE(S)) ---")
                     appendLine(rawText.take(32_000))
@@ -356,6 +359,7 @@ class DocumentOcrEngine(private val context: Context) {
                 ownerName = json.optNullableString("ownerName"),
                 fatherName = json.optNullableString("fatherName"),
                 motherName = json.optNullableString("motherName"),
+                spouseName = json.optNullableString("spouseName"),
                 dateOfBirth = json.optNullableString("dateOfBirth"),
                 gender = json.optNullableString("gender"),
                 documentNumber = json.optNullableString("documentNumber"),
@@ -364,6 +368,7 @@ class DocumentOcrEngine(private val context: Context) {
                 email = json.optNullableString("email"),
                 address = json.optNullableString("address"),
                 village = json.optNullableString("village"),
+                tehsil = json.optNullableString("tehsil"),
                 city = json.optNullableString("city"),
                 district = json.optNullableString("district"),
                 state = json.optNullableString("state"),
@@ -375,18 +380,19 @@ class DocumentOcrEngine(private val context: Context) {
                 documentSpecificFields = specificsMap
             )
 
-            // Stage 5: Reconcile AI + Local Deterministic Parser (recovers any blank fields present in OCR)
+            // Stage 5: Reconcile AI + Local Deterministic Parser (grounded anti-hallucination + recovery)
             val reconciled = DeterministicDocumentParser.reconcileWithAi(
                 ai = aiMeta,
                 localFallback = localFallback,
                 rawText = rawText,
                 stageSummary = buildString {
-                    append("6-Stage OCR (${pageSegments.size.coerceAtLeast(1)} page")
+                    append("9-Stage Universal OCR (${pageSegments.size.coerceAtLeast(1)} page")
                     if (pageSegments.size > 1) append("s")
                     append(")")
                     if (appliedRotationDeg != 0) append(" • Rotated $appliedRotationDeg°")
-                    if (contrastEnhanced) append(" • Contrast Enhanced")
-                }
+                    if (contrastEnhanced) append(" • Enhanced")
+                },
+                originalFilename = originalFilename
             )
 
             val finalEntity = reconciled.toDocumentExtractionEntity(rawText = rawText, isVerified = false)
@@ -512,31 +518,92 @@ class DocumentOcrEngine(private val context: Context) {
     }
 
     /**
-     * Runs both Latin and Devanagari (Hindi) ML Kit recognizers and merges unique lines cleanly.
+     * Runs both Latin and Devanagari (Hindi) ML Kit recognizers with spatial row reconstruction.
+     * Automatically runs a second adaptive-threshold OCR pass if first-pass readability is sparse.
      */
     private suspend fun recognizeBilingualText(bitmap: Bitmap): String {
-        val inputImage = InputImage.fromBitmap(bitmap, 0)
-        val latinText = runRecognizer(latinRecognizer, inputImage)
-        val hindiText = runRecognizer(devanagariRecognizer, inputImage)
+        val firstPass = recognizeBilingualSpatialPass(bitmap)
+        if (scoreOcrReadability(firstPass) >= 95) {
+            return firstPass
+        }
 
+        // Second pass on adaptive threshold variant to recover faint stamps, low-contrast tables, or watermarks
+        val thresholdBmp = ImagePreprocessor.createAdaptiveThresholdVariant(bitmap)
+        return try {
+            val secondPass = recognizeBilingualSpatialPass(thresholdBmp)
+            mergeUniqueOcrLines(firstPass, secondPass)
+        } finally {
+            if (thresholdBmp !== bitmap && !thresholdBmp.isRecycled) {
+                thresholdBmp.recycle()
+            }
+        }
+    }
+
+    private suspend fun recognizeBilingualSpatialPass(bitmap: Bitmap): String {
+        val inputImage = InputImage.fromBitmap(bitmap, 0)
+        val latinText = runRecognizerSpatial(latinRecognizer, inputImage)
+        val hindiText = runRecognizerSpatial(devanagariRecognizer, inputImage)
+        return mergeUniqueOcrLines(latinText, hindiText)
+    }
+
+    private fun mergeUniqueOcrLines(primary: String, secondary: String): String {
         val merged = linkedSetOf<String>()
-        latinText.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { merged.add(it) }
-        hindiText.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { line ->
-            // Prefer keeping Devanagari lines and non-duplicate English lines recovered by Devanagari engine
-            if (line.any { it in '\u0900'..'\u097F' } || merged.none { it.equals(line, ignoreCase = true) }) {
+        primary.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { merged.add(it) }
+        secondary.lines().map { it.trim() }.filter { it.isNotBlank() }.forEach { line ->
+            val hasDevanagari = line.any { it in '\u0900'..'\u097F' }
+            if (hasDevanagari || merged.none { it.equals(line, ignoreCase = true) }) {
                 merged.add(line)
             }
         }
         return merged.joinToString("\n")
     }
 
-    private suspend fun runRecognizer(
+    private suspend fun runRecognizerSpatial(
         client: com.google.mlkit.vision.text.TextRecognizer,
         image: InputImage
     ): String = suspendCancellableCoroutine { cont ->
         client.process(image)
-            .addOnSuccessListener { visionText -> cont.resume(visionText.text) }
+            .addOnSuccessListener { visionText -> cont.resume(reconstructSpatialText(visionText)) }
             .addOnFailureListener { cont.resume("") }
+    }
+
+    /**
+     * Reconstructs true left-to-right, top-to-bottom reading rows from ML Kit bounding boxes
+     * so two-column government certificates and tables preserve "Label: Value" structure.
+     */
+    private fun reconstructSpatialText(visionText: Text): String {
+        val allLines = visionText.textBlocks.flatMap { it.lines }
+        if (allLines.isEmpty()) return visionText.text
+
+        data class BoundedLine(val text: String, val left: Int, val top: Int, val centerY: Int, val height: Int)
+
+        val bounded = allLines.mapNotNull { line ->
+            val txt = line.text.trim()
+            val box = line.boundingBox
+            if (txt.isBlank()) null
+            else if (box == null) BoundedLine(txt, 0, Int.MAX_VALUE, Int.MAX_VALUE, 20)
+            else BoundedLine(txt, box.left, box.top, box.centerY(), box.height().coerceAtLeast(10))
+        }.sortedWith(compareBy<BoundedLine> { it.top }.thenBy { it.left })
+
+        if (bounded.isEmpty()) return visionText.text
+
+        val rows = mutableListOf<MutableList<BoundedLine>>()
+        for (item in bounded) {
+            val matchingRow = rows.lastOrNull()?.takeIf { row ->
+                val anchor = row.first()
+                val tolerance = (maxOf(anchor.height, item.height) * 0.65f).coerceAtLeast(12f)
+                kotlin.math.abs(item.centerY - anchor.centerY) <= tolerance
+            }
+            if (matchingRow != null) {
+                matchingRow.add(item)
+            } else {
+                rows.add(mutableListOf(item))
+            }
+        }
+
+        return rows.joinToString("\n") { row ->
+            row.sortedBy { it.left }.joinToString(" ") { it.text }
+        }
     }
 
     /**
@@ -585,7 +652,9 @@ class DocumentOcrEngine(private val context: Context) {
         val lines = text.lines().count { it.trim().length >= 3 }
         val cues = listOf(
             "government", "india", "aadhaar", "income", "tax", "passport", "driving", "licence",
-            "election", "bank", "invoice", "certificate", "name", "dob", "address", "भारत", "आधार", "नाम", "जन्म", "पता"
+            "election", "bank", "invoice", "certificate", "residence", "domicile", "caste",
+            "name", "dob", "address", "district", "tehsil", "tahsildar", "tehsildar",
+            "भारत", "आधार", "नाम", "जन्म", "पता", "निवास", "प्रमाण", "तहसील", "जिला", "जाति", "आय"
         ).count { text.contains(it, ignoreCase = true) }
         return cleanLetters + (lines * 4) + (cues * 25)
     }
