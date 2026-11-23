@@ -207,6 +207,66 @@ class DskLockerRepository(
         return finalizeFirebaseOwnerSession(session).map { it }
     }
 
+    suspend fun registerWithEmail(
+        email: String,
+        password: String,
+        displayName: String? = null
+    ): EmailAuthResult {
+        return when (val res = phoneAuth.registerWithEmailPassword(email, password, displayName)) {
+            is EmailAuthResult.Success -> {
+                val fin = finalizeFirebaseOwnerSession(res.session)
+                if (fin.isSuccess) {
+                    logSecurity("EMAIL_REGISTER_SUCCESS", "Registered ${res.session.email ?: res.session.uid}", true)
+                    res.copy(session = fin.getOrThrow())
+                } else {
+                    logSecurity("EMAIL_REGISTER_REJECTED", fin.exceptionOrNull()?.message ?: "Cloud verification rejected", false)
+                    EmailAuthResult.Error(fin.exceptionOrNull()?.localizedMessage ?: "Cloud verification rejected.")
+                }
+            }
+            is EmailAuthResult.Error -> {
+                logSecurity("EMAIL_REGISTER_FAILED", res.message, false)
+                res
+            }
+        }
+    }
+
+    suspend fun signInWithEmail(email: String, password: String): EmailAuthResult {
+        return when (val res = phoneAuth.signInWithEmailPassword(email, password)) {
+            is EmailAuthResult.Success -> {
+                val fin = finalizeFirebaseOwnerSession(res.session)
+                if (fin.isSuccess) {
+                    logSecurity("EMAIL_LOGIN_SUCCESS", "Signed in ${res.session.email ?: res.session.uid}", true)
+                    res.copy(session = fin.getOrThrow())
+                } else {
+                    logSecurity("EMAIL_LOGIN_REJECTED", fin.exceptionOrNull()?.message ?: "Cloud verification rejected", false)
+                    EmailAuthResult.Error(fin.exceptionOrNull()?.localizedMessage ?: "Cloud verification rejected.")
+                }
+            }
+            is EmailAuthResult.Error -> {
+                logSecurity("EMAIL_LOGIN_FAILED", res.message, false)
+                res
+            }
+        }
+    }
+
+    suspend fun sendPasswordResetEmail(email: String): Result<Unit> =
+        phoneAuth.sendPasswordResetEmail(email).also { res ->
+            logSecurity(
+                "EMAIL_PASSWORD_RESET",
+                if (res.isSuccess) "Password reset sent to ${email.trim()}" else res.exceptionOrNull()?.message ?: "Reset failed",
+                res.isSuccess
+            )
+        }
+
+    suspend fun sendCurrentUserVerificationEmail(): Result<Unit> =
+        phoneAuth.sendVerificationEmail()
+
+    suspend fun refreshEmailVerificationStatus(): Result<Boolean> =
+        phoneAuth.reloadEmailVerificationStatus()
+
+    fun currentUserEmailVerified(): Boolean? =
+        phoneAuth.currentUserEmailVerified()
+
     suspend fun finalizeFirebaseOwnerSession(session: FirebaseSessionUser): Result<FirebaseSessionUser> {
         val existingUid = prefs.firebaseUid
         if (!existingUid.isNullOrBlank() && existingUid != session.uid) {

@@ -10,11 +10,13 @@ import com.example.ai.DocumentOcrResult
 import com.example.ai.ExtendedOcrMetadata
 import com.example.data.DskLockerRepository
 import com.example.data.local.*
+import com.example.data.remote.AuthValidation
 import com.example.data.remote.BackendConfig
 import com.example.data.remote.BackendHealthStatusDto
 import com.example.data.remote.CloudBackupFilesResponseDto
 import com.example.data.remote.CloudBackupHistoryResponseDto
 import com.example.data.remote.CloudBackupStatusDto
+import com.example.data.remote.EmailAuthResult
 import com.example.data.remote.FetchedLinkMetadata
 import com.example.data.remote.GoogleSignInResult
 import com.example.data.remote.PhoneOtpStartResult
@@ -26,6 +28,7 @@ import com.example.storage.LocalFileManager
 import com.example.storage.NetworkStatusHelper
 import com.google.firebase.auth.PhoneAuthProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -155,8 +158,14 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _cloudAuthError = MutableStateFlow<String?>(null)
     val cloudAuthError: StateFlow<String?> = _cloudAuthError.asStateFlow()
 
+    private val _cloudAuthNotice = MutableStateFlow<String?>(null)
+    val cloudAuthNotice: StateFlow<String?> = _cloudAuthNotice.asStateFlow()
+
     private val _cloudSessionActive = MutableStateFlow(repo.hasFirebaseSession())
     val cloudSessionActive: StateFlow<Boolean> = _cloudSessionActive.asStateFlow()
+
+    private val _cloudEmailVerified = MutableStateFlow(repo.currentUserEmailVerified())
+    val cloudEmailVerified: StateFlow<Boolean?> = _cloudEmailVerified.asStateFlow()
 
     private val _otpPendingPhone = MutableStateFlow<String?>(null)
     val otpPendingPhone: StateFlow<String?> = _otpPendingPhone.asStateFlow()
@@ -164,7 +173,11 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _otpVerificationId = MutableStateFlow<String?>(null)
     val otpVerificationId: StateFlow<String?> = _otpVerificationId.asStateFlow()
 
+    private val _otpResendCooldownSeconds = MutableStateFlow(0)
+    val otpResendCooldownSeconds: StateFlow<Int> = _otpResendCooldownSeconds.asStateFlow()
+
     private var otpResendToken: PhoneAuthProvider.ForceResendingToken? = null
+    private var otpCooldownJob: Job? = null
 
     private var connectivityMonitor: ConnectivityBackupMonitor? = null
 
@@ -891,17 +904,26 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    // --- Neon Cloud Backup & Restore + Google Sign-In / Optional Phone OTP ---
+    // --- Neon Cloud Backup & Restore + Google / Email / Phone Auth ---
+    fun clearCloudAuthMessages() {
+        _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
+    }
+
     fun signInCloudWithGoogle(uiContext: Context) {
         if (_cloudAuthLoading.value) return
         _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
         _cloudAuthLoading.value = true
         viewModelScope.launch {
             val result = repo.signInWithGoogle(uiContext)
             _cloudAuthLoading.value = false
             _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudEmailVerified.value = repo.currentUserEmailVerified()
             when (result) {
                 is GoogleSignInResult.Success -> {
+                    otpCooldownJob?.cancel()
+                    _otpResendCooldownSeconds.value = 0
                     _otpVerificationId.value = null
                     _otpPendingPhone.value = null
                     val accountLabel = result.session.email?.takeIf { it.isNotBlank() }
@@ -919,14 +941,159 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun registerCloudWithEmail(
+        email: String,
+        password: String,
+        confirmPassword: String,
+        displayName: String = ""
+    ) {
+        if (_cloudAuthLoading.value) return
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            _cloudAuthError.value = "Enter a valid email address."
+            return
+        }
+        if (password.length < 6) {
+            _cloudAuthError.value = "Password must be at least 6 characters."
+            return
+        }
+        if (password != confirmPassword) {
+            _cloudAuthError.value = "Passwords do not match."
+            return
+        }
+        _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
+        _cloudAuthLoading.value = true
+        viewModelScope.launch {
+            val result = repo.registerWithEmail(cleanEmail, password, displayName.ifBlank { null })
+            _cloudAuthLoading.value = false
+            _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudEmailVerified.value = repo.currentUserEmailVerified()
+            when (result) {
+                is EmailAuthResult.Success -> {
+                    val msg = if (result.verificationEmailSent) {
+                        "Cloud account created ($cleanEmail). Verification email sent."
+                    } else {
+                        "Cloud account created ($cleanEmail)."
+                    }
+                    _cloudAuthNotice.value = msg
+                    _statusBanner.value = msg
+                    refreshCloudBackupDashboard()
+                }
+                is EmailAuthResult.Error -> {
+                    _cloudAuthError.value = result.message
+                }
+            }
+        }
+    }
+
+    fun signInCloudWithEmail(email: String, password: String) {
+        if (_cloudAuthLoading.value) return
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            _cloudAuthError.value = "Enter a valid email address."
+            return
+        }
+        if (password.isEmpty()) {
+            _cloudAuthError.value = "Enter your password."
+            return
+        }
+        _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
+        _cloudAuthLoading.value = true
+        viewModelScope.launch {
+            val result = repo.signInWithEmail(cleanEmail, password)
+            _cloudAuthLoading.value = false
+            _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudEmailVerified.value = repo.currentUserEmailVerified()
+            when (result) {
+                is EmailAuthResult.Success -> {
+                    val verifyNote = if (!result.isEmailVerified) " (Verify your email in Cloud Account settings)" else ""
+                    _statusBanner.value = "Signed in as ${result.session.email ?: cleanEmail}$verifyNote."
+                    refreshCloudBackupDashboard()
+                }
+                is EmailAuthResult.Error -> {
+                    _cloudAuthError.value = result.message
+                }
+            }
+        }
+    }
+
+    fun sendCloudPasswordReset(email: String) {
+        if (_cloudAuthLoading.value) return
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            _cloudAuthError.value = "Enter a valid email address to reset your password."
+            return
+        }
+        _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
+        _cloudAuthLoading.value = true
+        viewModelScope.launch {
+            val res = repo.sendPasswordResetEmail(cleanEmail)
+            _cloudAuthLoading.value = false
+            if (res.isSuccess) {
+                val msg = "Password reset link sent to $cleanEmail. Check your inbox or spam folder."
+                _cloudAuthNotice.value = msg
+                _statusBanner.value = msg
+            } else {
+                _cloudAuthError.value = res.exceptionOrNull()?.localizedMessage ?: "Unable to send password reset email."
+            }
+        }
+    }
+
+    fun sendCloudEmailVerification() {
+        if (_cloudAuthLoading.value) return
+        _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
+        _cloudAuthLoading.value = true
+        viewModelScope.launch {
+            val res = repo.sendCurrentUserVerificationEmail()
+            _cloudAuthLoading.value = false
+            if (res.isSuccess) {
+                val msg = "Verification email sent. Open the link in your inbox, then tap Refresh Status."
+                _cloudAuthNotice.value = msg
+                _statusBanner.value = msg
+            } else {
+                _cloudAuthError.value = res.exceptionOrNull()?.localizedMessage ?: "Failed to send verification email."
+            }
+        }
+    }
+
+    fun refreshCloudEmailVerification() {
+        if (_cloudAuthLoading.value) return
+        _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
+        _cloudAuthLoading.value = true
+        viewModelScope.launch {
+            val res = repo.refreshEmailVerificationStatus()
+            _cloudAuthLoading.value = false
+            if (res.isSuccess) {
+                val verified = res.getOrThrow()
+                _cloudEmailVerified.value = verified
+                val msg = if (verified) {
+                    "Email address verified."
+                } else {
+                    "Email is still unverified. Click the link in your email and try refreshing again."
+                }
+                _cloudAuthNotice.value = msg
+                _statusBanner.value = msg
+            } else {
+                _cloudAuthError.value = res.exceptionOrNull()?.localizedMessage ?: "Unable to refresh email status."
+            }
+        }
+    }
+
     fun attemptSilentCloudSignIn() {
         if (repo.hasFirebaseSession()) {
             _cloudSessionActive.value = true
+            _cloudEmailVerified.value = repo.currentUserEmailVerified()
             return
         }
         viewModelScope.launch {
             val res = repo.attemptSilentGoogleSignIn()
             _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudEmailVerified.value = repo.currentUserEmailVerified()
             if (res.getOrNull() != null) {
                 refreshCloudBackupDashboard()
             }
@@ -935,8 +1102,13 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun signOutCloudAccount() {
         viewModelScope.launch {
+            otpCooldownJob?.cancel()
+            _otpResendCooldownSeconds.value = 0
             repo.logoutSession()
             _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudEmailVerified.value = null
+            _cloudAuthNotice.value = null
+            _cloudAuthError.value = null
             _cloudBackupStatus.value = null
             _cloudRestorePreview.value = null
             _cloudHistory.value = null
@@ -944,19 +1116,35 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun sendCloudOtp(activity: Activity, rawPhoneInput: String, isResend: Boolean = false) {
-        val cleaned = rawPhoneInput.trim().replace(" ", "").let {
-            when {
-                it.startsWith("+") -> it
-                it.length == 10 && it.all { ch -> ch.isDigit() } -> "+91$it"
-                else -> it
+    private fun startOtpResendCooldown(seconds: Int = 60) {
+        otpCooldownJob?.cancel()
+        otpCooldownJob = viewModelScope.launch {
+            for (remaining in seconds downTo 0) {
+                _otpResendCooldownSeconds.value = remaining
+                if (remaining > 0) delay(1000L)
             }
         }
-        if (cleaned.length < 10 || !cleaned.startsWith("+")) {
-            _cloudAuthError.value = "Enter a valid phone number with country code (e.g. +919876543210)."
+    }
+
+    fun sendCloudOtp(
+        activity: Activity,
+        rawPhoneInput: String,
+        countryCode: String = "+91",
+        isResend: Boolean = false
+    ) {
+        if (isResend && _otpResendCooldownSeconds.value > 0) {
+            _cloudAuthError.value = "Please wait ${_otpResendCooldownSeconds.value}s before resending OTP."
             return
         }
+        val normalizedRes = AuthValidation.normalizeAndValidatePhone(rawPhoneInput, countryCode)
+        if (normalizedRes.isFailure) {
+            _cloudAuthError.value = normalizedRes.exceptionOrNull()?.message
+                ?: "Enter a valid phone number with country code."
+            return
+        }
+        val cleaned = normalizedRes.getOrThrow()
         _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
         _cloudAuthLoading.value = true
         _otpPendingPhone.value = cleaned
         repo.startFirebasePhoneOtp(
@@ -969,6 +1157,8 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                     _otpVerificationId.value = res.verificationId
                     otpResendToken = res.resendToken
                     _cloudAuthLoading.value = false
+                    _cloudAuthNotice.value = "6-digit SMS OTP sent to $cleaned."
+                    startOtpResendCooldown(60)
                 }
                 is PhoneOtpStartResult.AutoVerified -> {
                     viewModelScope.launch {
@@ -980,7 +1170,10 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                         val fin = repo.finalizeFirebaseOwnerSession(session)
                         _cloudAuthLoading.value = false
                         _cloudSessionActive.value = repo.hasFirebaseSession()
+                        _cloudEmailVerified.value = repo.currentUserEmailVerified()
                         if (fin.isSuccess) {
+                            otpCooldownJob?.cancel()
+                            _otpResendCooldownSeconds.value = 0
                             _otpVerificationId.value = null
                             _otpPendingPhone.value = null
                             _statusBanner.value = "Cloud account verified (${res.phoneNumber})."
@@ -1011,11 +1204,15 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
         _cloudAuthLoading.value = true
         _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
         viewModelScope.launch {
             val res = repo.verifyFirebaseOtp(verId, otpCode.trim(), phone)
             _cloudAuthLoading.value = false
             _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudEmailVerified.value = repo.currentUserEmailVerified()
             if (res.isSuccess) {
+                otpCooldownJob?.cancel()
+                _otpResendCooldownSeconds.value = 0
                 _otpVerificationId.value = null
                 _otpPendingPhone.value = null
                 _statusBanner.value = "Cloud account connected (${res.getOrThrow().phoneNumber})."
@@ -1027,9 +1224,12 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun cancelCloudOtp() {
+        otpCooldownJob?.cancel()
+        _otpResendCooldownSeconds.value = 0
         _otpVerificationId.value = null
         _otpPendingPhone.value = null
         _cloudAuthError.value = null
+        _cloudAuthNotice.value = null
         _cloudAuthLoading.value = false
     }
 

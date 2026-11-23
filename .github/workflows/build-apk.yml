@@ -150,10 +150,13 @@ jobs:
           import sys
 
           target = pathlib.Path("app/google-services.json")
-          b64 = os.environ.get("GOOGLE_SERVICES_JSON_B64", "").strip()
           raw = os.environ.get("GOOGLE_SERVICES_JSON_RAW", "").strip()
+          b64 = os.environ.get("GOOGLE_SERVICES_JSON_B64", "").strip()
 
-          if b64:
+          if raw:
+              target.write_text(raw + "\n", encoding="utf-8")
+              print("Populated app/google-services.json from GOOGLE_SERVICES_JSON secret.")
+          elif b64:
               try:
                   decoded = base64.b64decode("".join(b64.split()), validate=True)
               except binascii.Error as exc:
@@ -161,16 +164,13 @@ jobs:
                   sys.exit(1)
               target.write_bytes(decoded)
               print("Populated app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret.")
-          elif raw:
-              target.write_text(raw + "\n", encoding="utf-8")
-              print("Populated app/google-services.json from GOOGLE_SERVICES_JSON secret.")
           elif target.is_file() and target.stat().st_size > 0:
               print("Using committed app/google-services.json from repository.")
           else:
               print(
                   "ERROR: app/google-services.json is missing.\n"
                   "Add GitHub Repository Secret GOOGLE_SERVICES_JSON or GOOGLE_SERVICES_JSON_BASE64 "
-                  "(using your Firebase Android app google-services.json), or include app/google-services.json in the repo.",
+                  "(using your Firebase Android app google-services.json).",
                   file=sys.stderr,
               )
               sys.exit(1)
@@ -189,9 +189,11 @@ jobs:
               )
               sys.exit(1)
 
-          project_id = str(data.get("project_info", {}).get("project_id", "")).strip()
-          if not project_id or project_id in {"remixed-project-id", "your-project-id", "example"}:
-              print("ERROR: app/google-services.json has a missing or placeholder project_id.", file=sys.stderr)
+          project_info = data.get("project_info") or {}
+          project_id = str(project_info.get("project_id", "")).strip()
+          project_number = str(project_info.get("project_number", "")).strip()
+          if not project_id or not project_number or project_id in {"remixed-project-id", "your-project-id", "example"}:
+              print("ERROR: app/google-services.json has a missing or placeholder project_info.", file=sys.stderr)
               sys.exit(1)
 
           expected_pkg = "com.aistudio.dsklocker.vxqtzm"
@@ -210,6 +212,16 @@ jobs:
           if matched_client is None:
               print(
                   f"ERROR: app/google-services.json does not contain a client entry for package '{expected_pkg}'.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          mobilesdk_app_id = str(matched_client.get("client_info", {}).get("mobilesdk_app_id", "")).strip()
+          api_keys = matched_client.get("api_key") or []
+          has_api_key = any(str(k.get("current_key", "")).strip() for k in api_keys if isinstance(k, dict))
+          if not mobilesdk_app_id or not has_api_key:
+              print(
+                  f"ERROR: app/google-services.json entry for '{expected_pkg}' is missing mobilesdk_app_id or api_key.",
                   file=sys.stderr,
               )
               sys.exit(1)

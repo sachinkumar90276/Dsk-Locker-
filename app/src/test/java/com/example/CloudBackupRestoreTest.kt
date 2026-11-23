@@ -7,8 +7,10 @@ import com.example.ai.ExtendedOcrMetadata
 import com.example.ai.OcrMetadataStore
 import com.example.data.DskLockerRepository
 import com.example.data.local.*
+import com.example.data.remote.AuthValidation
 import com.example.data.remote.BackendConfig
 import com.example.data.remote.CloudBackupSettingsDto
+import com.example.data.remote.FirebasePhoneAuthManager
 import com.example.data.remote.FirebaseSessionUser
 import com.example.data.remote.SqlBackendClient
 import com.example.security.CryptoManager
@@ -408,6 +410,38 @@ class CloudBackupRestoreTest {
         repo.recoverInterruptedBackups()
 
         assertFalse(server.latestSettingsForUser("uid-user-a")?.wifiOnly ?: true)
+    }
+
+    @Test
+    fun `AuthValidation validates emails and normalizes country-code phone numbers cleanly`() {
+        assertTrue(AuthValidation.isValidEmail("sachin.vc.rajput@gmail.com"))
+        assertTrue(AuthValidation.isValidEmail("  user+tag@domain.co.in  "))
+        assertFalse(AuthValidation.isValidEmail("invalid-email"))
+        assertFalse(AuthValidation.isValidEmail("user@"))
+
+        val inPhone = AuthValidation.normalizeAndValidatePhone("09876543210", "+91")
+        assertTrue(inPhone.isSuccess)
+        assertEquals("+919876543210", inPhone.getOrThrow())
+
+        val usPhone = AuthValidation.normalizeAndValidatePhone("(415) 555-2671", "+1")
+        assertTrue(usPhone.isSuccess)
+        assertEquals("+14155552671", usPhone.getOrThrow())
+
+        val explicitOverride = AuthValidation.normalizeAndValidatePhone("+971501234567", "+91")
+        assertTrue(explicitOverride.isSuccess)
+        assertEquals("+971501234567", explicitOverride.getOrThrow())
+
+        val tooShort = AuthValidation.normalizeAndValidatePhone("12345", "+91")
+        assertTrue(tooShort.isFailure)
+        val blank = AuthValidation.normalizeAndValidatePhone("   ", "+91")
+        assertTrue(blank.isFailure)
+    }
+
+    @Test
+    fun `FirebasePhoneAuthManager formats email and phone auth errors cleanly`() {
+        val mgr = FirebasePhoneAuthManager()
+        assertTrue(mgr.formatAuthError(IllegalStateException("unknown status code: 17006"), isPhoneFlow = true).contains("17006"))
+        assertTrue(mgr.formatAuthError(IllegalStateException("OPERATION_NOT_ALLOWED"), isPhoneFlow = false).contains("Email/Password"))
     }
 
     /**

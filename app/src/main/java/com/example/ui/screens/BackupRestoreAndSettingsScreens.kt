@@ -11,9 +11,11 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
@@ -32,6 +34,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,6 +43,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.fragment.app.FragmentActivity
 import coil.compose.AsyncImage
 import com.example.data.local.*
+import com.example.data.remote.AuthValidation
 import com.example.data.remote.SqlSchemaViewerData
 import com.example.security.BiometricAvailability
 import com.example.security.BiometricHelper
@@ -87,13 +92,16 @@ fun BackupRestoreScreen(
     val backendHealthError by viewModel.backendHealthError.collectAsState()
     val cloudAuthLoading by viewModel.cloudAuthLoading.collectAsState()
     val cloudAuthError by viewModel.cloudAuthError.collectAsState()
+    val cloudAuthNotice by viewModel.cloudAuthNotice.collectAsState()
     val otpVerificationId by viewModel.otpVerificationId.collectAsState()
     val otpPendingPhone by viewModel.otpPendingPhone.collectAsState()
+    val otpResendCooldownSeconds by viewModel.otpResendCooldownSeconds.collectAsState()
     val lockoutSeconds by viewModel.lockoutSeconds.collectAsState()
 
     val settings = settingsState ?: UserSettingsEntity()
     val configIssue = viewModel.cloudBackendConfigurationIssue()
     val hasCloudSession by viewModel.cloudSessionActive.collectAsState()
+    val cloudEmailVerified by viewModel.cloudEmailVerified.collectAsState()
 
     LaunchedEffect(Unit) {
         viewModel.attemptSilentCloudSignIn()
@@ -228,6 +236,38 @@ fun BackupRestoreScreen(
                         fontSize = 11.sp,
                         color = if (hasCloudSession) EmeraldSync else ElectricBlue
                     )
+                }
+            }
+        }
+
+        if (hasCloudSession && cloudEmailVerified == false) {
+            item {
+                GlassCard4D(glowColor = AmberPending, contentPadding = PaddingValues(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.MarkEmailUnread, contentDescription = null, tint = AmberPending)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("EMAIL VERIFICATION PENDING", style = MaterialTheme.typography.labelLarge, color = AmberPending)
+                            Text(
+                                "Verify your email address via the link sent to your inbox, then tap Refresh.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = SilverWhite
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    enabled = !cloudAuthLoading,
+                                    onClick = { viewModel.sendCloudEmailVerification() },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) { Text("Resend Email", fontSize = 11.sp) }
+                                Button(
+                                    enabled = !cloudAuthLoading,
+                                    onClick = { viewModel.refreshCloudEmailVerification() },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) { Text("Refresh Status", fontSize = 11.sp) }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -663,137 +703,439 @@ fun BackupRestoreScreen(
     }
 
     if (showCloudOtpDialog) {
-        var phoneInput by remember { mutableStateOf(otpPendingPhone ?: viewModel.ownerPhoneDisplay().takeIf { it.startsWith("+") } ?: "+91") }
+        val defaultCountry = AuthValidation.supportedCountryCodes.first()
+        var selectedCountry by remember { mutableStateOf(defaultCountry) }
+        var countryDropdownExpanded by remember { mutableStateOf(false) }
+        var phoneDigitsInput by remember {
+            mutableStateOf(
+                otpPendingPhone?.removePrefix(defaultCountry.dialCode)
+                    ?: viewModel.ownerPhoneDisplay()
+                        .takeIf { it.startsWith("+") }
+                        ?.removePrefix(defaultCountry.dialCode)
+                        ?.filter { it.isDigit() }
+                    ?: ""
+            )
+        }
         var otpCode by remember { mutableStateOf("") }
-        var showPhoneOtpAdvanced by remember { mutableStateOf(otpVerificationId != null) }
+        // 0 = Google + Email, 1 = Phone OTP
+        var selectedAuthTab by remember { mutableIntStateOf(if (otpVerificationId != null) 1 else 0) }
+        // 0 = Sign In, 1 = Register, 2 = Reset Password
+        var emailMode by remember { mutableIntStateOf(0) }
+        var emailInput by remember { mutableStateOf("") }
+        var passwordInput by remember { mutableStateOf("") }
+        var confirmPasswordInput by remember { mutableStateOf("") }
+        var ownerNameInput by remember { mutableStateOf("") }
+        var showPassword by remember { mutableStateOf(false) }
+
         Dialog(onDismissRequest = {
             viewModel.cancelCloudOtp()
             showCloudOtpDialog = false
         }) {
             GlassCard4D(glowColor = ElectricBlue, contentPadding = PaddingValues(20.dp)) {
-                Text("CLOUD ACCOUNT LOGIN", style = MaterialTheme.typography.titleLarge, color = SilverWhite)
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    if (hasCloudSession) {
-                        "Linked to ${viewModel.ownerPhoneDisplay()}. Encrypted backups and restore are active on Neon PostgreSQL."
-                    } else {
-                        "Sign in with your Google account to link DSK LOCKER with your Render + Neon Cloud Backup."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MetallicSilver
-                )
-                Spacer(modifier = Modifier.height(14.dp))
-                if (hasCloudSession) {
-                    OutlinedButton(
-                        enabled = !cloudAuthLoading,
-                        onClick = {
-                            viewModel.signOutCloudAccount()
-                            showCloudOtpDialog = false
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text("CLOUD ACCOUNT LOGIN", style = MaterialTheme.typography.titleLarge, color = SilverWhite)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        if (hasCloudSession) {
+                            "Linked to ${viewModel.ownerPhoneDisplay()}. Encrypted backups and restore are active on Neon PostgreSQL."
+                        } else {
+                            "Connect with Google, Email & Password, or Phone OTP to sync encrypted backups."
                         },
-                        border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.7f)),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .testTag("cloud_sign_out_button")
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = CrimsonAlert, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Sign Out Cloud Session", color = CrimsonAlert, fontWeight = FontWeight.Bold)
-                    }
-                } else {
-                    Button(
-                        enabled = !cloudAuthLoading,
-                        onClick = { viewModel.signInCloudWithGoogle(activity ?: context) },
-                        colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp)
-                            .testTag("google_sign_in_button")
-                    ) {
-                        if (cloudAuthLoading && !showPhoneOtpAdvanced) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                                color = VoidBlack
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Connecting Google...", fontWeight = FontWeight.Bold)
-                        } else {
-                            Icon(Icons.Filled.AccountCircle, contentDescription = null, modifier = Modifier.size(20.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Sign in with Google", fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    TextButton(
-                        onClick = { showPhoneOtpAdvanced = !showPhoneOtpAdvanced },
-                        modifier = Modifier.align(Alignment.Start)
-                    ) {
-                        Text(
-                            if (showPhoneOtpAdvanced) "Hide Phone OTP Option" else "Advanced: Phone OTP (Custom Project)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MetallicSilver
-                        )
-                    }
-
-                    if (showPhoneOtpAdvanced) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        if (otpVerificationId == null) {
-                            OutlinedTextField(
-                                value = phoneInput,
-                                onValueChange = { phoneInput = it },
-                                label = { Text("Phone (+91...)") },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                                singleLine = true,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MetallicSilver
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    if (hasCloudSession) {
+                        if (cloudEmailVerified != null) {
+                            Surface(
+                                color = if (cloudEmailVerified == true) EmeraldSync.copy(alpha = 0.14f) else AmberPending.copy(alpha = 0.14f),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (cloudEmailVerified == true) EmeraldSync.copy(alpha = 0.5f) else AmberPending.copy(alpha = 0.5f)
+                                ),
                                 modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(
+                                        if (cloudEmailVerified == true) "Email Verified" else "Email Verification Pending",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (cloudEmailVerified == true) EmeraldSync else AmberPending
+                                    )
+                                    if (cloudEmailVerified == false) {
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            OutlinedButton(
+                                                enabled = !cloudAuthLoading,
+                                                onClick = { viewModel.sendCloudEmailVerification() }
+                                            ) { Text("Send Link", fontSize = 11.sp) }
+                                            Button(
+                                                enabled = !cloudAuthLoading,
+                                                onClick = { viewModel.refreshCloudEmailVerification() }
+                                            ) { Text("Check Verified", fontSize = 11.sp) }
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+                        OutlinedButton(
+                            enabled = !cloudAuthLoading,
+                            onClick = {
+                                viewModel.signOutCloudAccount()
+                                showCloudOtpDialog = false
+                            },
+                            border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.7f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("cloud_sign_out_button")
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = CrimsonAlert, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Sign Out Cloud Session", color = CrimsonAlert, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        Button(
+                            enabled = !cloudAuthLoading,
+                            onClick = { viewModel.signInCloudWithGoogle(activity ?: context) },
+                            colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp)
+                                .testTag("google_sign_in_button")
+                        ) {
+                            if (cloudAuthLoading && selectedAuthTab == 0 && emailInput.isBlank()) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = VoidBlack
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Connecting Google...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Filled.AccountCircle, contentDescription = null, modifier = Modifier.size(20.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Sign in with Google", fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            FilterChip(
+                                selected = selectedAuthTab == 0,
+                                onClick = {
+                                    selectedAuthTab = 0
+                                    viewModel.clearCloudAuthMessages()
+                                },
+                                label = { Text("Email Login") },
+                                leadingIcon = { Icon(Icons.Filled.Email, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("auth_mode_email_tab")
                             )
-                        } else {
-                            OutlinedTextField(
-                                value = otpCode,
-                                onValueChange = { if (it.length <= 6) otpCode = it.filter { ch -> ch.isDigit() } },
-                                label = { Text("6-Digit OTP") },
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth()
+                            FilterChip(
+                                selected = selectedAuthTab == 1,
+                                onClick = {
+                                    selectedAuthTab = 1
+                                    viewModel.clearCloudAuthMessages()
+                                },
+                                label = { Text("Phone OTP") },
+                                leadingIcon = { Icon(Icons.Filled.Sms, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("auth_mode_phone_tab")
                             )
                         }
-                    }
-                }
 
-                if (cloudAuthError != null) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(cloudAuthError!!, style = MaterialTheme.typography.labelMedium, color = CrimsonAlert)
-                }
+                        Spacer(modifier = Modifier.height(10.dp))
 
-                Spacer(modifier = Modifier.height(12.dp))
-                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                    TextButton(onClick = {
-                        viewModel.cancelCloudOtp()
-                        showCloudOtpDialog = false
-                    }) { Text("Close") }
-                    if (!hasCloudSession && showPhoneOtpAdvanced) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        if (otpVerificationId == null) {
-                            OutlinedButton(
-                                enabled = !cloudAuthLoading && activity != null,
-                                onClick = { activity?.let { viewModel.sendCloudOtp(it, phoneInput) } }
+                        if (selectedAuthTab == 0) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                FilterChip(
+                                    selected = emailMode == 0,
+                                    onClick = { emailMode = 0; viewModel.clearCloudAuthMessages() },
+                                    label = { Text("Sign In", fontSize = 11.sp) },
+                                    modifier = Modifier.testTag("email_mode_signin")
+                                )
+                                FilterChip(
+                                    selected = emailMode == 1,
+                                    onClick = { emailMode = 1; viewModel.clearCloudAuthMessages() },
+                                    label = { Text("Register", fontSize = 11.sp) },
+                                    modifier = Modifier.testTag("email_mode_register")
+                                )
+                                FilterChip(
+                                    selected = emailMode == 2,
+                                    onClick = { emailMode = 2; viewModel.clearCloudAuthMessages() },
+                                    label = { Text("Reset", fontSize = 11.sp) },
+                                    modifier = Modifier.testTag("email_mode_reset")
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            if (emailMode == 1) {
+                                OutlinedTextField(
+                                    value = ownerNameInput,
+                                    onValueChange = { ownerNameInput = it },
+                                    label = { Text("Full Name (Optional)") },
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("email_auth_name_input")
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+                            OutlinedTextField(
+                                value = emailInput,
+                                onValueChange = { emailInput = it },
+                                label = { Text("Email Address") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("email_auth_email_input")
+                            )
+                            if (emailMode != 2) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = passwordInput,
+                                    onValueChange = { passwordInput = it },
+                                    label = { Text("Password") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                    visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                                    trailingIcon = {
+                                        IconButton(onClick = { showPassword = !showPassword }) {
+                                            Icon(
+                                                if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                                contentDescription = if (showPassword) "Hide password" else "Show password"
+                                            )
+                                        }
+                                    },
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("email_auth_password_input")
+                                )
+                            }
+                            if (emailMode == 1) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = confirmPasswordInput,
+                                    onValueChange = { confirmPasswordInput = it },
+                                    label = { Text("Confirm Password") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                    visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("email_auth_confirm_password_input")
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Button(
+                                enabled = !cloudAuthLoading,
+                                onClick = {
+                                    when (emailMode) {
+                                        0 -> viewModel.signInCloudWithEmail(emailInput, passwordInput)
+                                        1 -> viewModel.registerCloudWithEmail(
+                                            email = emailInput,
+                                            password = passwordInput,
+                                            confirmPassword = confirmPasswordInput,
+                                            displayName = ownerNameInput
+                                        )
+                                        else -> viewModel.sendCloudPasswordReset(emailInput)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("email_auth_submit_button")
                             ) {
                                 if (cloudAuthLoading) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                } else {
-                                    Text("Send OTP")
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = VoidBlack)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                }
+                                Text(
+                                    when (emailMode) {
+                                        0 -> "Sign In with Email"
+                                        1 -> "Create Cloud Account"
+                                        else -> "Send Password Reset Email"
+                                    },
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            if (emailMode == 0) {
+                                TextButton(
+                                    onClick = { emailMode = 2; viewModel.clearCloudAuthMessages() },
+                                    modifier = Modifier
+                                        .align(Alignment.End)
+                                        .testTag("forgot_password_button")
+                                ) {
+                                    Text("Forgot Password?", fontSize = 12.sp, color = ElectricBlue)
                                 }
                             }
                         } else {
-                            Button(
-                                enabled = !cloudAuthLoading && otpCode.length == 6,
-                                onClick = { viewModel.verifyCloudOtp(otpCode) }
-                            ) {
-                                if (cloudAuthLoading) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                } else {
-                                    Text("Verify & Link")
+                            if (otpVerificationId == null) {
+                                Box(modifier = Modifier.fillMaxWidth()) {
+                                    OutlinedButton(
+                                        onClick = { countryDropdownExpanded = true },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("phone_country_code_selector")
+                                    ) {
+                                        Icon(Icons.Filled.Public, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            "${selectedCountry.isoCode} (${selectedCountry.dialCode}) — ${selectedCountry.countryName}",
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Icon(Icons.Filled.ArrowDropDown, contentDescription = "Select country code")
+                                    }
+                                    DropdownMenu(
+                                        expanded = countryDropdownExpanded,
+                                        onDismissRequest = { countryDropdownExpanded = false }
+                                    ) {
+                                        AuthValidation.supportedCountryCodes.forEach { country ->
+                                            DropdownMenuItem(
+                                                text = { Text("${country.isoCode} (${country.dialCode}) ${country.countryName}") },
+                                                onClick = {
+                                                    selectedCountry = country
+                                                    countryDropdownExpanded = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = phoneDigitsInput,
+                                    onValueChange = { raw ->
+                                        phoneDigitsInput = raw.filter { it.isDigit() || it == '+' }.take(15)
+                                    },
+                                    label = { Text("Mobile Number (${selectedCountry.dialCode})") },
+                                    placeholder = { Text("9876543210") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("phone_number_input")
+                                )
+                            } else {
+                                Text(
+                                    "Enter the 6-digit OTP sent to ${otpPendingPhone.orEmpty()}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MetallicSilver
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                OutlinedTextField(
+                                    value = otpCode,
+                                    onValueChange = { if (it.length <= 6) otpCode = it.filter { ch -> ch.isDigit() } },
+                                    label = { Text("6-Digit OTP") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                                    singleLine = true,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("phone_otp_input")
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    TextButton(
+                                        enabled = !cloudAuthLoading,
+                                        onClick = { viewModel.cancelCloudOtp() },
+                                        modifier = Modifier.testTag("change_phone_number_button")
+                                    ) {
+                                        Text("Change Number", fontSize = 12.sp)
+                                    }
+                                    TextButton(
+                                        enabled = !cloudAuthLoading && activity != null && otpResendCooldownSeconds == 0,
+                                        onClick = {
+                                            val targetPhone = otpPendingPhone ?: phoneDigitsInput
+                                            activity?.let {
+                                                viewModel.sendCloudOtp(
+                                                    activity = it,
+                                                    rawPhoneInput = targetPhone,
+                                                    countryCode = selectedCountry.dialCode,
+                                                    isResend = true
+                                                )
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("resend_otp_button")
+                                    ) {
+                                        Text(
+                                            if (otpResendCooldownSeconds > 0) {
+                                                "Resend OTP (${otpResendCooldownSeconds}s)"
+                                            } else {
+                                                "Resend OTP"
+                                            },
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (cloudAuthNotice != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(cloudAuthNotice!!, style = MaterialTheme.typography.labelMedium, color = EmeraldSync)
+                    }
+
+                    if (cloudAuthError != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(cloudAuthError!!, style = MaterialTheme.typography.labelMedium, color = CrimsonAlert)
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                        TextButton(onClick = {
+                            viewModel.cancelCloudOtp()
+                            showCloudOtpDialog = false
+                        }) { Text("Close") }
+                        if (!hasCloudSession && selectedAuthTab == 1) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            if (otpVerificationId == null) {
+                                Button(
+                                    enabled = !cloudAuthLoading && activity != null,
+                                    onClick = {
+                                        activity?.let {
+                                            viewModel.sendCloudOtp(
+                                                activity = it,
+                                                rawPhoneInput = phoneDigitsInput,
+                                                countryCode = selectedCountry.dialCode,
+                                                isResend = false
+                                            )
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("send_otp_button")
+                                ) {
+                                    if (cloudAuthLoading) {
+                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = VoidBlack)
+                                    } else {
+                                        Text("Send OTP")
+                                    }
+                                }
+                            } else {
+                                Button(
+                                    enabled = !cloudAuthLoading && otpCode.length == 6,
+                                    onClick = { viewModel.verifyCloudOtp(otpCode) },
+                                    modifier = Modifier.testTag("verify_otp_button")
+                                ) {
+                                    if (cloudAuthLoading) {
+                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = VoidBlack)
+                                    } else {
+                                        Text("Verify & Link")
+                                    }
                                 }
                             }
                         }

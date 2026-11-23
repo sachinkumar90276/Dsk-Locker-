@@ -23,6 +23,7 @@ import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.PhoneAuthCredential
 import com.google.firebase.auth.PhoneAuthOptions
 import com.google.firebase.auth.PhoneAuthProvider
+import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -32,6 +33,68 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.TimeUnit
 
 private const val AUTH_TAG = "DskFirebaseAuth"
+
+data class CountryDialCode(
+    val isoCode: String,
+    val countryName: String,
+    val dialCode: String,
+    val minDigits: Int = 7,
+    val maxDigits: Int = 12
+)
+
+object AuthValidation {
+    val supportedCountryCodes = listOf(
+        CountryDialCode("IN", "India", "+91", 10, 10),
+        CountryDialCode("US", "United States / Canada", "+1", 10, 10),
+        CountryDialCode("GB", "United Kingdom", "+44", 10, 10),
+        CountryDialCode("AE", "United Arab Emirates", "+971", 9, 9),
+        CountryDialCode("SG", "Singapore", "+65", 8, 8),
+        CountryDialCode("AU", "Australia", "+61", 9, 9),
+        CountryDialCode("DE", "Germany", "+49", 10, 11),
+        CountryDialCode("SA", "Saudi Arabia", "+966", 9, 9),
+        CountryDialCode("MY", "Malaysia", "+60", 9, 10),
+        CountryDialCode("JP", "Japan", "+81", 10, 10)
+    )
+
+    private val emailRegex = Regex("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")
+    private val e164Regex = Regex("^\\+[1-9]\\d{7,14}$")
+
+    fun isValidEmail(email: String): Boolean = emailRegex.matches(email.trim())
+
+    fun normalizeAndValidatePhone(rawInput: String, selectedCountryCode: String = "+91"): Result<String> {
+        val compact = rawInput.trim().replace(Regex("[\\s()-]"), "")
+        if (compact.isBlank()) {
+            return Result.failure(IllegalArgumentException("Enter a valid mobile number."))
+        }
+        val normalized = if (compact.startsWith("+")) {
+            "+" + compact.drop(1).filter { it.isDigit() }
+        } else {
+            val cc = if (selectedCountryCode.startsWith("+")) selectedCountryCode else "+$selectedCountryCode"
+            val digits = compact.filter { it.isDigit() }.trimStart('0')
+            "$cc$digits"
+        }
+        if (!e164Regex.matches(normalized)) {
+            return Result.failure(IllegalArgumentException("Enter a valid mobile number with country code (e.g. $selectedCountryCode 9876543210)."))
+        }
+        val matchedCountry = supportedCountryCodes
+            .sortedByDescending { it.dialCode.length }
+            .firstOrNull { normalized.startsWith(it.dialCode) }
+        if (matchedCountry != null) {
+            val subscriberLen = normalized.removePrefix(matchedCountry.dialCode).length
+            if (subscriberLen < matchedCountry.minDigits || subscriberLen > matchedCountry.maxDigits) {
+                val expectedDesc = if (matchedCountry.minDigits == matchedCountry.maxDigits) {
+                    "${matchedCountry.minDigits} digits"
+                } else {
+                    "${matchedCountry.minDigits}-${matchedCountry.maxDigits} digits"
+                }
+                return Result.failure(
+                    IllegalArgumentException("Phone number for ${matchedCountry.countryName} (${matchedCountry.dialCode}) must be $expectedDesc.")
+                )
+            }
+        }
+        return Result.success(normalized)
+    }
+}
 
 sealed interface PhoneOtpStartResult {
     data class CodeSent(val verificationId: String, val resendToken: PhoneAuthProvider.ForceResendingToken) : PhoneOtpStartResult
@@ -45,12 +108,22 @@ sealed interface GoogleSignInResult {
     data class Error(val message: String) : GoogleSignInResult
 }
 
+sealed interface EmailAuthResult {
+    data class Success(
+        val session: FirebaseSessionUser,
+        val verificationEmailSent: Boolean = false,
+        val isEmailVerified: Boolean = false
+    ) : EmailAuthResult
+    data class Error(val message: String) : EmailAuthResult
+}
+
 data class FirebaseSessionUser(
     val uid: String,
     val phoneNumber: String,
     val idToken: String,
     val email: String? = null,
-    val displayName: String? = null
+    val displayName: String? = null,
+    val isEmailVerified: Boolean = false
 )
 
 class FirebasePhoneAuthManager {
@@ -279,19 +352,168 @@ class FirebasePhoneAuthManager {
         throw IllegalStateException(formatAuthError(throwable), throwable)
     }
 
-    private fun formatAuthError(error: Throwable): String {
+    suspend fun registerWithEmailPassword(
+        email: String,
+        password: String,
+        displayName: String? = null
+    ): EmailAuthResult {
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            return EmailAuthResult.Error("Enter a valid email address.")
+        }
+        if (password.length < 6) {
+            return EmailAuthResult.Error("Password must be at least 6 characters.")
+        }
+        return try {
+            val authResult = auth.createUserWithEmailAndPassword(cleanEmail, password).await()
+            val user = authResult.user
+                ?: return EmailAuthResult.Error("Firebase returned null user after registration.")
+            val trimmedName = displayName?.trim().orEmpty()
+            if (trimmedName.isNotBlank()) {
+                runCatching {
+                    val profileReq = UserProfileChangeRequest.Builder()
+                        .setDisplayName(trimmedName)
+                        .build()
+                    user.updateProfile(profileReq).await()
+                }
+            }
+            val verificationSent = runCatching {
+                user.sendEmailVerification().await()
+                true
+            }.getOrDefault(false)
+            val token = user.getIdToken(true).await()?.token
+                ?: return EmailAuthResult.Error("Unable to retrieve Firebase ID token after registration.")
+            EmailAuthResult.Success(
+                session = FirebaseSessionUser(
+                    uid = user.uid,
+                    phoneNumber = user.phoneNumber.orEmpty(),
+                    idToken = token,
+                    email = user.email ?: cleanEmail,
+                    displayName = user.displayName ?: trimmedName.ifBlank { null },
+                    isEmailVerified = user.isEmailVerified
+                ),
+                verificationEmailSent = verificationSent,
+                isEmailVerified = user.isEmailVerified
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(AUTH_TAG, "Email registration failed: ${e.message}")
+            EmailAuthResult.Error(formatAuthError(e, isPhoneFlow = false))
+        }
+    }
+
+    suspend fun signInWithEmailPassword(
+        email: String,
+        password: String
+    ): EmailAuthResult {
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            return EmailAuthResult.Error("Enter a valid email address.")
+        }
+        if (password.isEmpty()) {
+            return EmailAuthResult.Error("Enter your password.")
+        }
+        return try {
+            val authResult = auth.signInWithEmailAndPassword(cleanEmail, password).await()
+            val user = authResult.user
+                ?: return EmailAuthResult.Error("Firebase returned null user after email sign-in.")
+            val token = user.getIdToken(true).await()?.token
+                ?: return EmailAuthResult.Error("Unable to retrieve Firebase ID token after email sign-in.")
+            EmailAuthResult.Success(
+                session = FirebaseSessionUser(
+                    uid = user.uid,
+                    phoneNumber = user.phoneNumber.orEmpty(),
+                    idToken = token,
+                    email = user.email ?: cleanEmail,
+                    displayName = user.displayName,
+                    isEmailVerified = user.isEmailVerified
+                ),
+                verificationEmailSent = false,
+                isEmailVerified = user.isEmailVerified
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(AUTH_TAG, "Email sign-in failed: ${e.message}")
+            EmailAuthResult.Error(formatAuthError(e, isPhoneFlow = false))
+        }
+    }
+
+    suspend fun sendPasswordResetEmail(email: String): Result<Unit> {
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            return Result.failure(IllegalArgumentException("Enter a valid email address to reset your password."))
+        }
+        return try {
+            auth.sendPasswordResetEmail(cleanEmail).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(AUTH_TAG, "Password reset failed: ${e.message}")
+            Result.failure(IllegalStateException(formatAuthError(e, isPhoneFlow = false), e))
+        }
+    }
+
+    suspend fun sendVerificationEmail(): Result<Unit> {
+        val user = currentUser()
+            ?: return Result.failure(IllegalStateException("No signed-in Firebase account found."))
+        return try {
+            user.sendEmailVerification().await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(AUTH_TAG, "Failed to send email verification: ${e.message}")
+            Result.failure(IllegalStateException(formatAuthError(e, isPhoneFlow = false), e))
+        }
+    }
+
+    suspend fun reloadEmailVerificationStatus(): Result<Boolean> {
+        val user = currentUser()
+            ?: return Result.failure(IllegalStateException("No signed-in Firebase account found."))
+        return try {
+            user.reload().await()
+            Result.success(auth.currentUser?.isEmailVerified ?: user.isEmailVerified)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(AUTH_TAG, "Failed to reload Firebase user verification: ${e.message}")
+            Result.failure(IllegalStateException(formatAuthError(e, isPhoneFlow = false), e))
+        }
+    }
+
+    fun currentUserEmailVerified(): Boolean? {
+        val user = currentUser() ?: return null
+        if (user.email.isNullOrBlank()) return null
+        return user.isEmailVerified
+    }
+
+    fun formatAuthError(error: Throwable, isPhoneFlow: Boolean = true): String {
         val code = (error as? FirebaseAuthException)?.errorCode
         val msg = error.localizedMessage.orEmpty()
         return when {
-            code == "ERROR_INVALID_PHONE_NUMBER" -> "Invalid +91 mobile number format."
+            code == "ERROR_INVALID_PHONE_NUMBER" -> "Invalid mobile number format. Include country code (e.g. +91)."
             code == "ERROR_INVALID_VERIFICATION_CODE" -> "Incorrect 6-digit SMS OTP code."
             code == "ERROR_SESSION_EXPIRED" -> "OTP expired. Tap Resend OTP for a fresh SMS code."
+            code == "ERROR_EMAIL_ALREADY_IN_USE" -> "An account with this email already exists. Sign in or reset your password."
+            code == "ERROR_INVALID_EMAIL" -> "Invalid email address format."
+            code == "ERROR_WEAK_PASSWORD" -> "Password is too weak. Use at least 6 characters."
+            code == "ERROR_WRONG_PASSWORD" || code == "ERROR_INVALID_CREDENTIAL" ->
+                "Incorrect email or password."
+            code == "ERROR_USER_NOT_FOUND" -> "No Firebase account exists for this email address."
+            code == "ERROR_USER_DISABLED" -> "This Firebase account has been disabled."
             code == "ERROR_TOO_MANY_REQUESTS" || code == "ERROR_QUOTA_EXCEEDED" ->
-                "SMS OTP rate limit reached. Wait briefly before retrying."
+                "Too many authentication attempts. Wait briefly before retrying."
             code == "ERROR_OPERATION_NOT_ALLOWED" ||
                 msg.contains("17006") ||
                 msg.contains("OPERATION_NOT_ALLOWED", ignoreCase = true) ->
-                "Phone OTP is disabled on this Firebase project (Error 17006). Use Sign in with Google instead."
+                if (isPhoneFlow || msg.contains("17006")) {
+                    "Phone OTP is disabled on this Firebase project (Error 17006). Enable Phone Auth in Firebase Console or use Google / Email Login."
+                } else {
+                    "Email/Password sign-in is disabled on this Firebase project. Enable Email/Password in Firebase Console."
+                }
             code == "ERROR_APP_NOT_AUTHORIZED" ||
                 code == "ERROR_MISSING_CLIENT_IDENTIFIER" ||
                 code == "ERROR_CAPTCHA_CHECK_FAILED" ||
@@ -299,8 +521,8 @@ class FirebasePhoneAuthManager {
                 msg.contains("Recaptcha", ignoreCase = true) ||
                 msg.contains("siteKey", ignoreCase = true) ||
                 msg.contains("Play Integrity", ignoreCase = true) ->
-                "Phone verification requires Play Integrity or reCAPTCHA Enterprise. Use Sign in with Google instead."
-            else -> msg.ifBlank { "Firebase Phone authentication error." }
+                "Phone verification requires Play Integrity or reCAPTCHA verification. Use Google or Email Login instead."
+            else -> msg.ifBlank { "Firebase authentication error." }
         }
     }
 
