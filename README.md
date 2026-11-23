@@ -125,7 +125,9 @@ gradle :app:bundleRelease
    git push -u origin main
    ```
 4. **Automatic GitHub Actions APK Build (`.github/workflows/build-apk.yml`):**
-   - Every push to `main` (or manual **Run workflow** via **Actions → Build DSK LOCKER Android APK**) runs unit tests and builds `app/build/outputs/apk/debug/app-debug.apk`.
+   - Every push to `main` (or manual **Run workflow** via **Actions → Build DSK LOCKER Android APK**) validates `app/google-services.json`, runs unit tests, and builds `app/build/outputs/apk/debug/app-debug.apk`.
    - Download the generated APK from the completed workflow run under **Artifacts → `DSK-Locker-APK`**.
-5. **Release Signing Secrets in GitHub Actions (Optional):**
-   Add `KEYSTORE_BASE64`, `STORE_PASSWORD`, and `KEY_PASSWORD` as **GitHub Repository Secrets** before running automated release APK/AAB builds.
+5. **Firebase & Signing Secrets in GitHub Actions:**
+   - **Firebase Android config:** Ensure `app/google-services.json` is present or add `GOOGLE_SERVICES_JSON` (raw JSON) or `GOOGLE_SERVICES_JSON_BASE64` as a **GitHub Repository Secret**. Never place Firebase Admin `firebase-service-account.json` credentials into `GOOGLE_SERVICES_JSON`.
+   - **Debug keystore (optional override):** `debug.keystore.base64` is already configured to match the registered debug SHA-1, or you can override it via `DEBUG_KEYSTORE_BASE64` in **GitHub Repository Secrets**.
+   - **Release signing (optional):** Add `KEYSTORE_BASE64`, `STORE_PASSWORD`, and `KEY_PASSWORD` as **GitHub Repository Secrets** before running automated release APK/AAB builds.

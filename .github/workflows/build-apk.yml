@@ -97,6 +97,7 @@ jobs:
         shell: bash
         env:
           CI_BACKEND_API_URL: ${{ secrets.BACKEND_API_URL || vars.BACKEND_API_URL }}
+          CI_DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
           if [ ! -f .env ] && [ -f .env.example ]; then
@@ -109,9 +110,13 @@ jobs:
               echo "BACKEND_API_URL=${CI_BACKEND_API_URL}" >> .env
             fi
           fi
-          if [ ! -f debug.keystore ]; then
+          if [ -n "${CI_DEBUG_KEYSTORE_B64:-}" ]; then
+            printf '%s' "$CI_DEBUG_KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > debug.keystore
+            echo "Restored debug.keystore from DEBUG_KEYSTORE_BASE64 secret."
+          elif [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then
-              base64 -d debug.keystore.base64 > debug.keystore
+              tr -d '[:space:]' < debug.keystore.base64 | base64 -d > debug.keystore
+              echo "Restored debug.keystore from repository debug.keystore.base64."
             else
               keytool -genkeypair -v \
                 -keystore debug.keystore \
@@ -122,7 +127,138 @@ jobs:
                 -keysize 2048 \
                 -validity 10000 \
                 -dname "CN=Android Debug,O=Android,C=US"
+              echo "Generated fresh debug.keystore."
             fi
+          fi
+          DEBUG_SHA1=$(keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | awk -F': ' '/SHA1:/ {gsub(/:/, "", $2); print tolower($2); exit}')
+          echo "DEBUG_KEYSTORE_SHA1=$DEBUG_SHA1" >> "$GITHUB_ENV"
+          echo "Active debug keystore SHA-1 configured."
+
+      - name: Configure & Verify Firebase google-services.json
+        shell: bash
+        env:
+          GOOGLE_SERVICES_JSON_B64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          GOOGLE_SERVICES_JSON_RAW: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import binascii
+          import json
+          import os
+          import pathlib
+          import sys
+
+          target = pathlib.Path("app/google-services.json")
+          b64 = os.environ.get("GOOGLE_SERVICES_JSON_B64", "").strip()
+          raw = os.environ.get("GOOGLE_SERVICES_JSON_RAW", "").strip()
+
+          if b64:
+              try:
+                  decoded = base64.b64decode("".join(b64.split()), validate=True)
+              except binascii.Error as exc:
+                  print(f"ERROR: GOOGLE_SERVICES_JSON_BASE64 is not valid base64: {exc}", file=sys.stderr)
+                  sys.exit(1)
+              target.write_bytes(decoded)
+              print("Populated app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret.")
+          elif raw:
+              target.write_text(raw + "\n", encoding="utf-8")
+              print("Populated app/google-services.json from GOOGLE_SERVICES_JSON secret.")
+          elif target.is_file() and target.stat().st_size > 0:
+              print("Using committed app/google-services.json from repository.")
+          else:
+              print(
+                  "ERROR: app/google-services.json is missing.\n"
+                  "Add GitHub Repository Secret GOOGLE_SERVICES_JSON or GOOGLE_SERVICES_JSON_BASE64 "
+                  "(using your Firebase Android app google-services.json), or include app/google-services.json in the repo.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          try:
+              data = json.loads(target.read_text(encoding="utf-8"))
+          except Exception as exc:
+              print(f"ERROR: app/google-services.json is not valid JSON: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          if data.get("type") == "service_account" or "private_key" in data:
+              print(
+                  "ERROR: app/google-services.json appears to be a Firebase Admin service account key. "
+                  "Never place service account credentials in app/google-services.json; use the Android client google-services.json.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          project_id = str(data.get("project_info", {}).get("project_id", "")).strip()
+          if not project_id or project_id in {"remixed-project-id", "your-project-id", "example"}:
+              print("ERROR: app/google-services.json has a missing or placeholder project_id.", file=sys.stderr)
+              sys.exit(1)
+
+          expected_pkg = "com.aistudio.dsklocker.vxqtzm"
+          clients = data.get("client")
+          if not isinstance(clients, list) or not clients:
+              print("ERROR: app/google-services.json contains no client entries.", file=sys.stderr)
+              sys.exit(1)
+
+          matched_client = None
+          for client in clients:
+              pkg = client.get("client_info", {}).get("android_client_info", {}).get("package_name")
+              if pkg == expected_pkg:
+                  matched_client = client
+                  break
+
+          if matched_client is None:
+              print(
+                  f"ERROR: app/google-services.json does not contain a client entry for package '{expected_pkg}'.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          oauth_clients = matched_client.get("oauth_client") or []
+          web_clients = [c for c in oauth_clients if c.get("client_type") == 3 and str(c.get("client_id", "")).strip()]
+          if not web_clients:
+              print(
+                  "ERROR: app/google-services.json is missing a Web OAuth client (client_type: 3) for "
+                  f"'{expected_pkg}'. The Google Services plugin cannot generate R.string.default_web_client_id without it. "
+                  "Enable Google Sign-In in Firebase Authentication and re-download google-services.json.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          android_hashes = [
+              str(c.get("android_info", {}).get("certificate_hash", "")).replace(":", "").strip().lower()
+              for c in oauth_clients
+              if c.get("client_type") == 1
+          ]
+          active_sha1 = os.environ.get("DEBUG_KEYSTORE_SHA1", "").strip().lower()
+          if active_sha1 and android_hashes and active_sha1 not in android_hashes:
+              print(
+                  "WARNING: Active debug.keystore SHA-1 is not listed in app/google-services.json Android OAuth clients. "
+                  "APK compilation will succeed, but Google Sign-In at runtime requires registering this SHA-1 in Firebase Console.",
+                  file=sys.stderr,
+              )
+          elif not android_hashes:
+              print(
+                  "WARNING: No Android OAuth client (client_type: 1) found in app/google-services.json. "
+                  "Register your debug SHA-1 in Firebase Console for Google Sign-In.",
+                  file=sys.stderr,
+              )
+
+          print(
+              f"Verified Firebase config: project_id={project_id}, package={expected_pkg}, "
+              f"web_oauth_clients={len(web_clients)}, android_oauth_clients={len(android_hashes)}"
+          )
+          PY
+
+      - name: Run Android Unit Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+          else
+            gradle :app:testDebugUnitTest --no-daemon --stacktrace
           fi
 
       - name: Build Android Debug APK
@@ -131,7 +267,7 @@ jobs:
           set -euo pipefail
           if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            ./gradlew :app:assembleDebug --no-daemon --stacktrace
           else
             gradle :app:assembleDebug --no-daemon --stacktrace
           fi

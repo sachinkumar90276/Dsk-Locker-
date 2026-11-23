@@ -2,6 +2,7 @@ package com.example.data.remote
 
 import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.util.Log
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
@@ -154,7 +155,7 @@ class FirebasePhoneAuthManager {
 
         return try {
             val credentialManager = CredentialManager.create(context)
-            val activityContext = (context as? Activity) ?: context
+            val activityContext = findActivity(context) ?: context
             val cred = credentialManager.getCredential(activityContext, request).credential
             if (cred is CustomCredential && cred.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val googleIdToken = GoogleIdTokenCredential.createFrom(cred.data).idToken
@@ -301,5 +302,11 @@ class FirebasePhoneAuthManager {
                 "Phone verification requires Play Integrity or reCAPTCHA Enterprise. Use Sign in with Google instead."
             else -> msg.ifBlank { "Firebase Phone authentication error." }
         }
+    }
+
+    private tailrec fun findActivity(context: Context): Activity? = when (context) {
+        is Activity -> context
+        is ContextWrapper -> findActivity(context.baseContext)
+        else -> null
     }
 }
