@@ -1,0 +1,26 @@
+# Exclude Android build artifacts, Gradle caches, local dependencies, and secrets from Docker build context
+.git/
+.github/
+.gradle/
+.kotlin/
+.idea/
+app/
+build/
+captures/
+gradle/
+*.apk
+*.aab
+*.jks
+*.keystore
+debug.keystore
+debug.keystore.base64
+local.properties
+.env
+*.env
+*.env.*
+!backend/.env.example
+*service-account*.json
+backend/node_modules/
+backend/dist/
+npm-debug.log*
+.DS_Store
