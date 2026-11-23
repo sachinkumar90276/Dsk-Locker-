@@ -15,7 +15,7 @@ enum class DeleteMode(val label: String, val subtitle: String) {
     ),
     CLOUD_ONLY(
         "DELETE FROM CLOUD ONLY",
-        "Removes file from Firebase Storage Cloud. Local phone copy stays intact."
+        "Removes file from Neon Cloud Backup. Local phone copy stays intact."
     ),
     BOTH(
         "DELETE FROM BOTH",

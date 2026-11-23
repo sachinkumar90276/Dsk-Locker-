@@ -7,6 +7,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  verify-backend:
+    name: Verify Node.js Backend Build & Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies & build backend
+        run: npm ci --include=dev && npm run build
+
+      - name: Run backend integration tests
+        run: npm test
+
   build-apk:
     name: Build Android Debug APK
     runs-on: ubuntu-latest
@@ -72,10 +95,19 @@ jobs:
 
       - name: Prepare environment & Android debug keystore
         shell: bash
+        env:
+          CI_BACKEND_API_URL: ${{ secrets.BACKEND_API_URL || vars.BACKEND_API_URL }}
         run: |
           set -euo pipefail
           if [ ! -f .env ] && [ -f .env.example ]; then
             cp .env.example .env
+          fi
+          if [ -n "${CI_BACKEND_API_URL:-}" ]; then
+            if grep -q '^BACKEND_API_URL=' .env 2>/dev/null; then
+              sed -i "s|^BACKEND_API_URL=.*|BACKEND_API_URL=${CI_BACKEND_API_URL}|" .env
+            else
+              echo "BACKEND_API_URL=${CI_BACKEND_API_URL}" >> .env
+            fi
           fi
           if [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then

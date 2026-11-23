@@ -52,7 +52,8 @@ object LocalFileManager {
         uri: Uri,
         isInVault: Boolean = false,
         folderId: String? = null,
-        forcedCategoryId: String? = null
+        forcedCategoryId: String? = null,
+        portableVaultKeyBase64: String? = null
     ): Result<FileItemEntity> = withContext(Dispatchers.IO) {
         runCatching {
             val resolver = context.contentResolver
@@ -96,9 +97,15 @@ object LocalFileManager {
             val sha256 = CryptoManager.sha256File(tempPlainFile)
 
             if (isInVault) {
+                val portableKey = portableVaultKeyBase64?.takeIf { it.isNotBlank() }
+                    ?.let { CryptoManager.secretKeyFromBase64(it) }
                 tempPlainFile.inputStream().use { input ->
                     destFile.outputStream().use { output ->
-                        CryptoManager.encryptStream(input, output)
+                        if (portableKey != null) {
+                            CryptoManager.encryptStreamWithKey(portableKey, input, output)
+                        } else {
+                            CryptoManager.encryptStream(input, output)
+                        }
                     }
                 }
                 tempPlainFile.delete()
@@ -137,15 +144,40 @@ object LocalFileManager {
         }
     }
 
-    suspend fun resolveReadableFile(context: Context, item: FileItemEntity): File? = withContext(Dispatchers.IO) {
+    suspend fun resolveReadableFile(
+        context: Context,
+        item: FileItemEntity,
+        portableVaultKeyBase64: String? = null
+    ): File? = withContext(Dispatchers.IO) {
         val local = item.localPath?.let { File(it) } ?: return@withContext null
         if (!local.exists()) return@withContext null
         if (!item.isInVault) return@withContext local
 
         val outFile = File(getPreviewCacheDir(context), "${item.id}_${item.originalFilename}")
-        local.inputStream().use { input ->
-            outFile.outputStream().use { output ->
-                CryptoManager.decryptStream(input, output)
+        val portableKey = portableVaultKeyBase64?.takeIf { it.isNotBlank() }
+            ?.let { runCatching { CryptoManager.secretKeyFromBase64(it) }.getOrNull() }
+
+        val decryptedWithPortable = if (portableKey != null) {
+            runCatching {
+                local.inputStream().use { input ->
+                    outFile.outputStream().use { output ->
+                        CryptoManager.decryptStreamWithKey(portableKey, input, output)
+                    }
+                }
+            }.isSuccess
+        } else false
+
+        if (!decryptedWithPortable) {
+            val decryptedWithHardware = runCatching {
+                local.inputStream().use { input ->
+                    outFile.outputStream().use { output ->
+                        CryptoManager.decryptStream(input, output)
+                    }
+                }
+            }.isSuccess
+            if (!decryptedWithHardware) {
+                runCatching { outFile.delete() }
+                return@withContext null
             }
         }
         outFile

@@ -1,0 +1,698 @@
+package com.example
+
+import android.content.Context
+import android.util.Base64
+import androidx.test.core.app.ApplicationProvider
+import com.example.ai.ExtendedOcrMetadata
+import com.example.ai.OcrMetadataStore
+import com.example.data.DskLockerRepository
+import com.example.data.local.*
+import com.example.data.remote.BackendConfig
+import com.example.data.remote.CloudBackupSettingsDto
+import com.example.data.remote.SqlBackendClient
+import com.example.security.CryptoManager
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.io.File
+import java.net.InetSocketAddress
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36])
+class CloudBackupRestoreTest {
+
+    private lateinit var context: Context
+    private lateinit var server: FakeRenderNeonServer
+    private lateinit var baseUrl: String
+
+    @Before
+    fun setUp() {
+        context = ApplicationProvider.getApplicationContext()
+        server = FakeRenderNeonServer()
+        baseUrl = server.start()
+    }
+
+    @After
+    fun tearDown() {
+        server.stop()
+    }
+
+    @Test
+    fun `supabase URL is explicitly blocked by SqlBackendClient and never contacted`() = runBlocking {
+        val supabaseClient = SqlBackendClient { "https://iwjojoukkqapdogxezdj.supabase.co/rest/v1" }
+        val res = supabaseClient.fetchBackupStatus("token-user-a")
+        assertTrue(res.isFailure)
+        assertTrue(res.exceptionOrNull()?.message?.contains("Supabase", ignoreCase = true) == true)
+    }
+
+    @Test
+    fun `offline and server-error backup never deletes local files and retry succeeds cleanly`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        val db = DskLockerDatabase.getInstance(context)
+
+        val localFile = File(context.filesDir, "offline_contract.pdf").apply {
+            writeText("%PDF-1.4\nOffline safe test PDF")
+        }
+        val sha = CryptoManager.sha256File(localFile)
+        val item = FileItemEntity(
+            id = "offline-doc-1",
+            originalFilename = "offline_contract.pdf",
+            displayName = "Rent Agreement",
+            categoryId = DskCategories.CAT_DOCUMENTS,
+            mimeType = "application/pdf",
+            sizeBytes = localFile.length(),
+            localPath = localFile.absolutePath,
+            backupStatus = BackupStatus.BACKUP_PENDING,
+            sha256 = sha
+        )
+        db.fileItemDao().upsert(item)
+
+        // Simulate 413 failure on server -> marks BACKUP_FAILED, keeps local file intact
+        server.forceNextCreateErrorCode = 413
+        server.forceNextCreateErrorMessage = "File too large for tier"
+        val failedSummary = repo.runNeonCloudBackup(isManual = true)
+        assertEquals(0, failedSummary.uploadedCount)
+        assertEquals(1, failedSummary.failedCount)
+        assertTrue(localFile.exists())
+        assertEquals(BackupStatus.BACKUP_FAILED, db.fileItemDao().getFileById("offline-doc-1")?.backupStatus)
+
+        // Simulate offline IOException (unreachable port) -> queues BACKUP_PENDING, keeps local file intact
+        val deadRepo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { "http://127.0.0.1:1" },
+            idTokenOverride = { "token-user-a" }
+        )
+        val offlineSummary = deadRepo.runNeonCloudBackup(filesToBackup = listOf(item), isManual = true)
+        assertEquals(0, offlineSummary.uploadedCount)
+        assertTrue(offlineSummary.transientRetryNeeded)
+        assertTrue(localFile.exists())
+        assertEquals(BackupStatus.BACKUP_PENDING, db.fileItemDao().getFileById("offline-doc-1")?.backupStatus)
+
+        // Retry when online -> succeeds & marks MOBILE_AND_CLOUD
+        server.forceNextCreateErrorCode = null
+        val okSummary = repo.runNeonCloudBackup(isManual = true)
+        assertEquals(1, okSummary.uploadedCount)
+        assertEquals(0, okSummary.failedCount)
+        assertEquals(BackupStatus.MOBILE_AND_CLOUD, db.fileItemDao().getFileById("offline-doc-1")?.backupStatus)
+        assertTrue(localFile.exists())
+    }
+
+    @Test
+    fun `full cloud backup and reinstall restore preserves files, vault portable key decryption, folders, notes, OCR, and reminders`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        val db = DskLockerDatabase.getInstance(context)
+
+        // Configure owner MPIN & sync hash to backend
+        repo.saveNewMpin("482910")
+        assertTrue(repo.verifyMpinWithBackendIfLinked("482910", "VERIFY").isSuccess)
+
+        // Create folder, custom category, text note, saved link
+        db.customCategoryDao().upsert(CustomCategoryEntity(id = "cat-tax", name = "Tax Filings"))
+        db.folderDao().upsert(FolderEntity(id = "folder-ids", name = "Gov IDs", categoryId = DskCategories.CAT_DOCUMENTS))
+        db.textNoteDao().upsert(TextNoteEntity(id = "note-1", title = "Locker Note", content = "Account Backup OK"))
+        db.savedLinkDao().upsert(
+            SavedLinkEntity(
+                id = "link-1",
+                linkType = "WEBSITE_LINK",
+                title = "DigiLocker",
+                url = "https://digilocker.gov.in",
+                categoryId = DskCategories.CAT_WEBSITE_LINKS
+            )
+        )
+
+        // 1. Plain PDF document + OCR + Extended OCR + Reminder
+        val pdfFile = File(context.filesDir, "pan_doc.pdf").apply {
+            writeText("%PDF-1.4\nPAN ABCDE1234F Aarav")
+        }
+        val pdfItem = FileItemEntity(
+            id = "doc-pdf-1",
+            originalFilename = "pan_doc.pdf",
+            displayName = "PAN Card - Aarav",
+            categoryId = DskCategories.CAT_DOCUMENTS,
+            folderId = "folder-ids",
+            mimeType = "application/pdf",
+            sizeBytes = pdfFile.length(),
+            localPath = pdfFile.absolutePath,
+            backupStatus = BackupStatus.BACKUP_PENDING,
+            sha256 = CryptoManager.sha256File(pdfFile)
+        )
+        db.fileItemDao().upsert(pdfItem)
+        db.documentExtractionDao().upsert(
+            DocumentExtractionEntity(
+                fileId = "doc-pdf-1",
+                documentName = "PAN Card",
+                documentType = "PAN Card",
+                documentNumber = "ABCDE1234F",
+                ownerName = "Aarav Sharma",
+                rawText = "INCOME TAX DEPARTMENT ABCDE1234F",
+                isVerified = true
+            )
+        )
+        OcrMetadataStore.save(
+            context,
+            ExtendedOcrMetadata(
+                fileId = "doc-pdf-1",
+                stageSummary = "Verified PAN",
+                confidenceScore = 95,
+                confidenceLabel = "HIGH"
+            )
+        )
+        db.documentReminderDao().upsert(
+            DocumentReminderEntity(
+                id = "rem-1",
+                fileId = "doc-pdf-1",
+                documentName = "PAN Card",
+                expiryDateIso = "2032-05-01"
+            )
+        )
+
+        // 2. Image file
+        val imgBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 10, 20, 30, 40)
+        val imgFile = File(context.filesDir, "photo_id.png").apply { writeBytes(imgBytes) }
+        val imgItem = FileItemEntity(
+            id = "img-1",
+            originalFilename = "photo_id.png",
+            displayName = "Passport Size Photo",
+            categoryId = DskCategories.CAT_PHOTOS,
+            mimeType = "image/png",
+            sizeBytes = imgBytes.size.toLong(),
+            localPath = imgFile.absolutePath,
+            backupStatus = BackupStatus.BACKUP_PENDING,
+            sha256 = CryptoManager.sha256File(imgFile)
+        )
+        db.fileItemDao().upsert(imgItem)
+
+        // 3. Vault item encrypted with portable AES-256-GCM DEK (keyVersion = 1)
+        val portableKey = repo.prefs.getOrCreatePortableVaultKeyBase64()
+        val vaultPlainBytes = "Top Secret Vault Seed Recovery".toByteArray()
+        val vaultEncFile = File(context.filesDir, "vault_secret.enc")
+        vaultPlainBytes.inputStream().use { inp ->
+            vaultEncFile.outputStream().use { out ->
+                CryptoManager.encryptStreamWithKey(CryptoManager.secretKeyFromBase64(portableKey), inp, out)
+            }
+        }
+        repo.prefs.setFileKeyVersion("vault-1", 1)
+        val vaultItem = FileItemEntity(
+            id = "vault-1",
+            originalFilename = "secret_seed.txt",
+            displayName = "Secret Seed",
+            categoryId = DskCategories.CAT_DOCUMENTS,
+            mimeType = "text/plain",
+            sizeBytes = vaultPlainBytes.size.toLong(),
+            localPath = vaultEncFile.absolutePath,
+            backupStatus = BackupStatus.BACKUP_PENDING,
+            sha256 = CryptoManager.sha256Bytes(vaultPlainBytes),
+            isInVault = true
+        )
+        db.fileItemDao().upsert(vaultItem)
+
+        // Back up everything to Render + Neon
+        val summary = repo.runNeonCloudBackup(isManual = true)
+        assertEquals(3, summary.uploadedCount)
+        assertEquals(0, summary.failedCount)
+        assertEquals(3, server.filesForUser("uid-user-a").size)
+
+        // Verify cloud status & strict multi-user isolation (User B sees 0 files)
+        val statusA = repo.fetchCloudStatus().getOrThrow()
+        assertEquals(3, statusA.backedUpFilesCount)
+        assertEquals(1, statusA.vaultFilesCount)
+        assertEquals(1, statusA.notesCount)
+        assertEquals(1, statusA.foldersCount)
+        assertTrue(statusA.hasWrappedRecoveryKey)
+
+        val repoUserB = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-b" }
+        )
+        assertEquals(0, repoUserB.fetchCloudStatus().getOrThrow().backedUpFilesCount)
+
+        // Simulate app reinstall on a new phone: wipe local Room tables, delete local files, clear portable vault key
+        withContext(Dispatchers.IO) { db.clearAllTables() }
+        pdfFile.delete()
+        imgFile.delete()
+        vaultEncFile.delete()
+        repo.prefs.saveRecoveredPortableVaultKeyBase64("") // clear local portable key so server must unwrap with MPIN
+        assertNull(db.fileItemDao().getFileById("doc-pdf-1"))
+
+        // Restore using owner session + verified MPIN
+        val restoreRes = repo.restoreFullFromNeon(
+            overwriteExisting = false,
+            verifiedMpinForKeyRecovery = "482910"
+        )
+        assertTrue(restoreRes.isSuccess)
+        val restored = restoreRes.getOrThrow()
+        assertEquals(3, restored.verifiedCount)
+        assertEquals(0, restored.failedCount)
+        assertEquals(0, restored.missingKeyFailures)
+
+        // Verify restored PDF content, OCR metadata, extended JSON, reminder, folder, note, link
+        val restoredPdf = db.fileItemDao().getFileById("doc-pdf-1")!!
+        assertEquals(BackupStatus.MOBILE_AND_CLOUD, restoredPdf.backupStatus)
+        assertTrue(File(restoredPdf.localPath!!).readText().contains("ABCDE1234F"))
+        val restoredExt = db.documentExtractionDao().getForFile("doc-pdf-1")!!
+        assertEquals("ABCDE1234F", restoredExt.documentNumber)
+        assertEquals("Verified PAN", OcrMetadataStore.load(context, "doc-pdf-1")?.stageSummary)
+        assertEquals("2032-05-01", db.documentReminderDao().getAllOnce().first { it.fileId == "doc-pdf-1" }.expiryDateIso)
+        assertTrue(db.folderDao().getFoldersOnce().any { it.name == "Gov IDs" })
+        assertTrue(db.textNoteDao().getActiveOnce().any { it.title == "Locker Note" })
+        assertTrue(db.savedLinkDao().getActiveOnce().any { it.title == "DigiLocker" })
+
+        // Verify restored Vault file decrypts using the recovered portable key!
+        val restoredVault = db.fileItemDao().getFileById("vault-1")!!
+        val decryptedVault = repo.resolveReadableFile(restoredVault)
+        assertNotNull(decryptedVault)
+        assertEquals("Top Secret Vault Seed Recovery", decryptedVault!!.readText())
+    }
+
+    @Test
+    fun `corrupted download triggers SHA-256 mismatch failure and missing wrapped key fails honestly`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        val db = DskLockerDatabase.getInstance(context)
+
+        // Back up one normal PDF and one legacy v0 hardware-key vault entry without wrapped recovery key
+        val pdfFile = File(context.filesDir, "integrity_test.pdf").apply { writeText("Original Clean Bytes") }
+        val item = FileItemEntity(
+            id = "tamper-1",
+            originalFilename = "integrity_test.pdf",
+            displayName = "Clean Doc",
+            categoryId = DskCategories.CAT_DOCUMENTS,
+            mimeType = "application/pdf",
+            sizeBytes = pdfFile.length(),
+            localPath = pdfFile.absolutePath,
+            backupStatus = BackupStatus.BACKUP_PENDING,
+            sha256 = CryptoManager.sha256File(pdfFile)
+        )
+        db.fileItemDao().upsert(item)
+        assertEquals(1, repo.runNeonCloudBackup(isManual = true).uploadedCount)
+
+        // Inject bit-flip corruption on server response during download -> restore MUST reject!
+        withContext(Dispatchers.IO) { db.clearAllTables() }
+        pdfFile.delete()
+        server.corruptDownloadForFileId = "tamper-1"
+        val res = repo.restoreFullFromNeon(fileIds = listOf("tamper-1"))
+        assertTrue(res.isSuccess)
+        val summary = res.getOrThrow()
+        assertEquals(0, summary.verifiedCount)
+        assertEquals(1, summary.failedCount)
+        assertNull(db.fileItemDao().getFileById("tamper-1"))
+        val logs = repo.backupHistory.first()
+        assertTrue(logs.any { it.action == "RESTORE" && it.status == "FAILED" && it.message.contains("SHA-256") })
+
+        // Test honest failure when an encrypted vault item has no wrapped recovery key on server
+        server.corruptDownloadForFileId = null
+        server.seedUnrecoverableVaultItem("uid-user-a", "orphan-vault-1")
+        val orphanRes = repo.restoreFullFromNeon(fileIds = listOf("orphan-vault-1")).getOrThrow()
+        assertEquals(0, orphanRes.verifiedCount)
+        assertEquals(1, orphanRes.missingKeyFailures)
+        assertTrue(orphanRes.notice.contains("encryption key is unavailable", ignoreCase = true))
+    }
+
+    @Test
+    fun `recoverInterruptedBackups and backup settings update execute cleanly`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        repo.ensureDefaultsInitialized()
+        repo.updateSettings { it.copy(autoBackupEnabled = true, wifiOnly = false) }
+        repo.recoverInterruptedBackups()
+
+        assertFalse(server.latestSettingsForUser("uid-user-a")?.wifiOnly ?: true)
+    }
+
+    /**
+     * Lightweight real HTTP server emulating the Render + Neon Cloud Backup API endpoints for OkHttp integration tests.
+     */
+    private class FakeRenderNeonServer {
+        private var httpServer: HttpServer? = null
+        private val filesByUser = ConcurrentHashMap<String, ConcurrentHashMap<String, StoredFile>>()
+        private val snapshotsByUser = ConcurrentHashMap<String, JSONObject>()
+        private val securityByUser = ConcurrentHashMap<String, SecurityState>()
+        private val settingsByUser = ConcurrentHashMap<String, CloudBackupSettingsDto>()
+        private val restoresByUser = ConcurrentHashMap<String, MutableList<JSONObject>>()
+        private val historyByUser = ConcurrentHashMap<String, MutableList<JSONObject>>()
+
+        @Volatile var forceNextCreateErrorCode: Int? = null
+        @Volatile var forceNextCreateErrorMessage: String? = null
+        @Volatile var corruptDownloadForFileId: String? = null
+
+        data class StoredFile(
+            val fileId: String,
+            val originalFilename: String,
+            val displayName: String,
+            val categoryId: String,
+            val folderId: String?,
+            val mimeType: String,
+            val sizeBytes: Long,
+            val sha256: String,
+            val isInVault: Boolean,
+            val isFavorite: Boolean,
+            val isEncryptedPayload: Boolean,
+            val keyVersion: Int,
+            val metadataJson: JSONObject,
+            val createdAt: Long,
+            val updatedAt: Long,
+            val bytes: ByteArray
+        )
+
+        data class SecurityState(
+            var mpinHash: String = "",
+            var mpinSalt: String = "",
+            var wrappedVaultKey: String? = null,
+            var keyVersion: Int = 0
+        )
+
+        fun start(): String {
+            val s = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            s.createContext("/api/") { ex ->
+                try {
+                    handle(ex)
+                } catch (t: Throwable) {
+                    sendJson(ex, 500, JSONObject().put("error", t.message ?: "Server error"))
+                }
+            }
+            s.start()
+            httpServer = s
+            return "http://127.0.0.1:${s.address.port}"
+        }
+
+        fun stop() {
+            httpServer?.stop(0)
+            httpServer = null
+        }
+
+        fun filesForUser(uid: String): Map<String, StoredFile> = filesByUser[uid].orEmpty()
+        fun latestSettingsForUser(uid: String): CloudBackupSettingsDto? = settingsByUser[uid]
+
+        fun seedUnrecoverableVaultItem(uid: String, fileId: String) {
+            val map = filesByUser.getOrPut(uid) { ConcurrentHashMap() }
+            val cipher = ByteArray(32) { it.toByte() }
+            val sha = sha256Hex(cipher)
+            map[fileId] = StoredFile(
+                fileId = fileId,
+                originalFilename = "legacy_vault.enc",
+                displayName = "Legacy Vault",
+                categoryId = DskCategories.CAT_DOCUMENTS,
+                folderId = null,
+                mimeType = "text/plain",
+                sizeBytes = cipher.size.toLong(),
+                sha256 = sha,
+                isInVault = true,
+                isFavorite = false,
+                isEncryptedPayload = true,
+                keyVersion = 0,
+                metadataJson = JSONObject(),
+                createdAt = System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis(),
+                bytes = cipher
+            )
+            securityByUser[uid]?.wrappedVaultKey = null
+        }
+
+        private fun handle(ex: HttpExchange) {
+            val authHeader = ex.requestHeaders.getFirst("Authorization").orEmpty()
+            val token = authHeader.removePrefix("Bearer ").trim()
+            val uid = when (token) {
+                "token-user-a" -> "uid-user-a"
+                "token-user-b" -> "uid-user-b"
+                else -> {
+                    sendJson(ex, 401, JSONObject().put("error", "Unauthorized"))
+                    return
+                }
+            }
+
+            val path = ex.requestURI.path
+            val method = ex.requestMethod
+            val bodyText = ex.requestBody.bufferedReader().readText()
+
+            when {
+                method == "PUT" && path == "/api/security/mpin" -> {
+                    val j = JSONObject(bodyText)
+                    val st = securityByUser.getOrPut(uid) { SecurityState() }
+                    st.mpinHash = j.getString("mpinHash")
+                    st.mpinSalt = j.getString("mpinSalt")
+                    sendJson(ex, 200, JSONObject().put("ok", true))
+                }
+
+                method == "POST" && path == "/api/security/mpin/verify" -> {
+                    val j = JSONObject(bodyText)
+                    val st = securityByUser[uid]
+                    if (st == null || !CryptoManager.verifyMpin(j.getString("mpin"), st.mpinSalt, st.mpinHash)) {
+                        sendJson(ex, 401, JSONObject().put("error", "Incorrect MPIN."))
+                    } else {
+                        sendJson(ex, 200, JSONObject().put("ok", true))
+                    }
+                }
+
+                method == "POST" && path == "/api/security/recovery-key" -> {
+                    val j = JSONObject(bodyText)
+                    val st = securityByUser.getOrPut(uid) { SecurityState() }
+                    if (j.getString("action") == "wrap") {
+                        st.wrappedVaultKey = j.getString("vaultKeyBase64")
+                        st.keyVersion = j.optInt("keyVersion", 1)
+                        sendJson(ex, 200, JSONObject().put("ok", true))
+                    } else {
+                        val pin = j.optString("mpin", "")
+                        if (st.mpinHash.isNotBlank() && !CryptoManager.verifyMpin(pin, st.mpinSalt, st.mpinHash)) {
+                            sendJson(ex, 401, JSONObject().put("error", "Incorrect MPIN."))
+                        } else if (st.wrappedVaultKey.isNullOrBlank()) {
+                            sendJson(ex, 404, JSONObject().put("error", "No wrapped key stored."))
+                        } else {
+                            sendJson(ex, 200, JSONObject().put("ok", true).put("vaultKeyBase64", st.wrappedVaultKey).put("keyVersion", st.keyVersion))
+                        }
+                    }
+                }
+
+                method == "PUT" && path == "/api/backup/settings" -> {
+                    val j = JSONObject(bodyText)
+                    settingsByUser[uid] = CloudBackupSettingsDto(
+                        cloudBackupEnabled = j.optBoolean("cloudBackupEnabled", true),
+                        wifiOnly = j.optBoolean("wifiOnly", true),
+                        backupPhotos = j.optBoolean("backupPhotos", true),
+                        backupVideos = j.optBoolean("backupVideos", true),
+                        backupDocuments = j.optBoolean("backupDocuments", true)
+                    )
+                    sendJson(ex, 200, JSONObject().put("ok", true))
+                }
+
+                method == "POST" && path == "/api/backup/create" -> {
+                    val errCode = forceNextCreateErrorCode
+                    if (errCode != null) {
+                        sendJson(ex, errCode, JSONObject().put("error", forceNextCreateErrorMessage ?: "Upload failed"))
+                        return
+                    }
+                    val j = JSONObject(bodyText)
+                    val filesArr = j.optJSONArray("files") ?: JSONArray()
+                    val userMap = filesByUser.getOrPut(uid) { ConcurrentHashMap() }
+                    val histList = historyByUser.getOrPut(uid) { mutableListOf() }
+
+                    for (i in 0 until filesArr.length()) {
+                        val f = filesArr.getJSONObject(i)
+                        val bytes = Base64.decode(f.getString("fileContentBase64"), Base64.DEFAULT)
+                        val metaJson = JSONObject()
+                            .putOpt("extraction", f.optJSONObject("extraction"))
+                            .putOpt("extendedOcrJson", f.opt("extendedOcrJson"))
+                            .putOpt("reminder", f.optJSONObject("reminder"))
+                        val fileId = f.getString("fileId")
+                        userMap[fileId] = StoredFile(
+                            fileId = fileId,
+                            originalFilename = f.getString("originalFilename"),
+                            displayName = f.getString("displayName"),
+                            categoryId = f.getString("categoryId"),
+                            folderId = f.optString("folderId").takeIf { it.isNotBlank() && it != "null" },
+                            mimeType = f.optString("mimeType", "application/octet-stream"),
+                            sizeBytes = bytes.size.toLong(),
+                            sha256 = sha256Hex(bytes),
+                            isInVault = f.optBoolean("isInVault", false),
+                            isFavorite = f.optBoolean("isFavorite", false),
+                            isEncryptedPayload = f.optBoolean("isEncryptedPayload", false),
+                            keyVersion = f.optInt("keyVersion", 0),
+                            metadataJson = metaJson,
+                            createdAt = f.getLong("createdAt"),
+                            updatedAt = f.getLong("updatedAt"),
+                            bytes = bytes
+                        )
+                        histList.add(
+                            JSONObject()
+                                .put("id", "h_${fileId}_${System.currentTimeMillis()}")
+                                .put("file_id", fileId)
+                                .put("file_name", f.getString("displayName"))
+                                .put("action", j.optString("action", "MANUAL_BACKUP"))
+                                .put("status", "SUCCESS")
+                                .put("bytes_transferred", bytes.size)
+                                .put("message", "Backed up")
+                                .put("timestamp", System.currentTimeMillis())
+                        )
+                    }
+                    j.optJSONObject("snapshot")?.let { snapshotsByUser[uid] = it }
+
+                    val totalBytes = userMap.values.sumOf { it.sizeBytes }
+                    sendJson(
+                        ex,
+                        200,
+                        JSONObject()
+                            .put("ok", true)
+                            .put("backupId", "bk_1")
+                            .put("storedCount", filesArr.length())
+                            .put("backedUpDocuments", userMap.size)
+                            .put("totalBackupBytes", totalBytes)
+                            .put("quotaLimitBytes", 450L * 1024L * 1024L)
+                            .put("lastBackupAt", System.currentTimeMillis())
+                    )
+                }
+
+                method == "GET" && path == "/api/backup/status" -> {
+                    val userMap = filesByUser[uid].orEmpty()
+                    val snap = snapshotsByUser[uid] ?: JSONObject()
+                    val st = securityByUser[uid]
+                    sendJson(
+                        ex,
+                        200,
+                        JSONObject()
+                            .put("userId", uid)
+                            .put("lastBackupId", "bk_1")
+                            .put("lastBackupAt", System.currentTimeMillis())
+                            .put("lastBackupStatus", "COMPLETED")
+                            .put("backedUpFilesCount", userMap.size)
+                            .put("totalBackupSizeBytes", userMap.values.sumOf { it.sizeBytes })
+                            .put("photosCount", userMap.values.count { it.categoryId == DskCategories.CAT_PHOTOS })
+                            .put("pdfsCount", userMap.values.count { it.mimeType == "application/pdf" })
+                            .put("documentsCount", userMap.values.count { it.categoryId == DskCategories.CAT_DOCUMENTS })
+                            .put("videosCount", 0)
+                            .put("vaultFilesCount", userMap.values.count { it.isInVault })
+                            .put("notesCount", snap.optJSONArray("textNotes")?.length() ?: 0)
+                            .put("foldersCount", snap.optJSONArray("folders")?.length() ?: 0)
+                            .put("categoriesCount", snap.optJSONArray("customCategories")?.length() ?: 0)
+                            .put("linksCount", snap.optJSONArray("savedLinks")?.length() ?: 0)
+                            .put("quotaLimitBytes", 450L * 1024L * 1024L)
+                            .put("maxFileBytes", 20L * 1024L * 1024L)
+                            .put("neonDbUsedBytes", userMap.values.sumOf { it.sizeBytes })
+                            .put("neonDbLimitBytes", 512L * 1024L * 1024L)
+                            .put("hasWrappedRecoveryKey", !st?.wrappedVaultKey.isNullOrBlank())
+                            .put("vaultKeyVersion", st?.keyVersion ?: 0)
+                            .put("settings", JSONObject().put("cloudBackupEnabled", true).put("wifiOnly", true))
+                    )
+                }
+
+                method == "GET" && path == "/api/backup/files" -> {
+                    val userMap = filesByUser[uid].orEmpty()
+                    val arr = JSONArray()
+                    userMap.values.forEach { arr.put(it.toJson()) }
+                    sendJson(ex, 200, JSONObject().put("files", arr).put("snapshot", snapshotsByUser[uid] ?: JSONObject()))
+                }
+
+                method == "GET" && path == "/api/backup/history" -> {
+                    val bArr = JSONArray()
+                    historyByUser[uid].orEmpty().forEach { bArr.put(it) }
+                    val rArr = JSONArray()
+                    restoresByUser[uid].orEmpty().forEach { rArr.put(it) }
+                    sendJson(ex, 200, JSONObject().put("backups", bArr).put("restores", rArr))
+                }
+
+                method == "POST" && path == "/api/backup/restore" -> {
+                    val req = JSONObject(bodyText)
+                    val filterIds = req.optJSONArray("fileIds")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() }
+                    val userMap = filesByUser[uid].orEmpty()
+                    val matched = userMap.values.filter { filterIds == null || it.fileId in filterIds }
+                    val arr = JSONArray()
+                    matched.forEach { arr.put(it.toJson()) }
+                    val st = securityByUser[uid]
+                    sendJson(
+                        ex,
+                        200,
+                        JSONObject()
+                            .put("restoreId", "rst_${System.currentTimeMillis()}")
+                            .put("totalFiles", matched.size)
+                            .put("totalBytes", matched.sumOf { it.sizeBytes })
+                            .put("files", arr)
+                            .put("snapshot", snapshotsByUser[uid] ?: JSONObject())
+                            .put("hasWrappedRecoveryKey", !st?.wrappedVaultKey.isNullOrBlank())
+                    )
+                }
+
+                method == "POST" && path == "/api/backup/restore/complete" -> {
+                    val j = JSONObject(bodyText)
+                    restoresByUser.getOrPut(uid) { mutableListOf() }.add(j)
+                    sendJson(ex, 200, JSONObject().put("ok", true))
+                }
+
+                method == "GET" && path.startsWith("/api/backup/files/") && path.endsWith("/content") -> {
+                    val fileId = path.removePrefix("/api/backup/files/").removeSuffix("/content")
+                    val row = filesByUser[uid]?.get(fileId)
+                    if (row == null) {
+                        sendJson(ex, 404, JSONObject().put("error", "Not found"))
+                        return
+                    }
+                    val bytesToSend = if (corruptDownloadForFileId == fileId) {
+                        row.bytes.copyOf().also { if (it.isNotEmpty()) it[0] = (it[0].toInt() xor 0xFF).toByte() }
+                    } else row.bytes
+
+                    ex.responseHeaders.add("Content-Type", row.mimeType)
+                    ex.responseHeaders.add("X-File-Sha256", row.sha256)
+                    ex.responseHeaders.add("X-Is-Encrypted-Payload", row.isEncryptedPayload.toString())
+                    ex.responseHeaders.add("X-Key-Version", row.keyVersion.toString())
+                    ex.sendResponseHeaders(200, bytesToSend.size.toLong())
+                    ex.responseBody.use { it.write(bytesToSend) }
+                }
+
+                else -> sendJson(ex, 404, JSONObject().put("error", "Route not handled: $method $path"))
+            }
+        }
+
+        private fun StoredFile.toJson(): JSONObject =
+            JSONObject()
+                .put("file_id", fileId)
+                .put("original_filename", originalFilename)
+                .put("display_name", displayName)
+                .put("category_id", categoryId)
+                .putOpt("folder_id", folderId)
+                .put("mime_type", mimeType)
+                .put("size_bytes", sizeBytes)
+                .put("sha256", sha256)
+                .put("is_in_vault", isInVault)
+                .put("is_favorite", isFavorite)
+                .put("is_encrypted_payload", isEncryptedPayload)
+                .put("key_version", keyVersion)
+                .put("metadata_json", metadataJson)
+                .put("created_at", createdAt)
+                .put("updated_at", updatedAt)
+
+        private fun sha256Hex(bytes: ByteArray): String =
+            MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+        private fun sendJson(ex: HttpExchange, status: Int, json: JSONObject) {
+            val bytes = json.toString().toByteArray()
+            ex.responseHeaders.add("Content-Type", "application/json")
+            ex.sendResponseHeaders(status, bytes.size.toLong())
+            ex.responseBody.use { it.write(bytes) }
+        }
+    }
+}

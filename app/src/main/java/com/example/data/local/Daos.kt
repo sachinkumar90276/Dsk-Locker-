@@ -62,6 +62,9 @@ interface CustomCategoryDao {
     @Query("SELECT * FROM custom_categories ORDER BY createdAt ASC")
     fun observeCustomCategories(): Flow<List<CustomCategoryEntity>>
 
+    @Query("SELECT * FROM custom_categories ORDER BY createdAt ASC")
+    suspend fun getAllOnce(): List<CustomCategoryEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(category: CustomCategoryEntity)
 
@@ -73,6 +76,9 @@ interface CustomCategoryDao {
 interface DocumentExtractionDao {
     @Query("SELECT * FROM document_extractions")
     fun observeAll(): Flow<List<DocumentExtractionEntity>>
+
+    @Query("SELECT * FROM document_extractions")
+    suspend fun getAllOnce(): List<DocumentExtractionEntity>
 
     @Query("SELECT * FROM document_extractions WHERE fileId = :fileId LIMIT 1")
     fun observeForFile(fileId: String): Flow<DocumentExtractionEntity?>
@@ -107,6 +113,9 @@ interface TextNoteDao {
     @Query("SELECT * FROM text_notes WHERE isDeleted = 0 ORDER BY updatedAt DESC")
     fun observeActiveNotes(): Flow<List<TextNoteEntity>>
 
+    @Query("SELECT * FROM text_notes WHERE isDeleted = 0 ORDER BY updatedAt DESC")
+    suspend fun getActiveOnce(): List<TextNoteEntity>
+
     @Query("SELECT * FROM text_notes WHERE isDeleted = 1 ORDER BY deletedAt DESC")
     fun observeTrashNotes(): Flow<List<TextNoteEntity>>
 
@@ -124,6 +133,9 @@ interface TextNoteDao {
 interface SavedLinkDao {
     @Query("SELECT * FROM saved_links WHERE isDeleted = 0 ORDER BY updatedAt DESC")
     fun observeActiveLinks(): Flow<List<SavedLinkEntity>>
+
+    @Query("SELECT * FROM saved_links WHERE isDeleted = 0 ORDER BY updatedAt DESC")
+    suspend fun getActiveOnce(): List<SavedLinkEntity>
 
     @Query("SELECT * FROM saved_links WHERE isDeleted = 1 ORDER BY deletedAt DESC")
     fun observeTrashLinks(): Flow<List<SavedLinkEntity>>
@@ -175,4 +187,25 @@ interface ProfileSettingsDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSettings(settings: UserSettingsEntity)
+}
+
+@Dao
+interface BackupSnapshotDao {
+    @Query("SELECT * FROM backup_snapshots ORDER BY startedAt DESC LIMIT 50")
+    fun observeRecent(): Flow<List<BackupSnapshotEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(snapshot: BackupSnapshotEntity)
+}
+
+@Dao
+interface PendingSyncOpDao {
+    @Query("SELECT * FROM pending_sync_ops ORDER BY createdAt ASC")
+    suspend fun getAllOnce(): List<PendingSyncOpEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(op: PendingSyncOpEntity)
+
+    @Query("DELETE FROM pending_sync_ops WHERE id = :id")
+    suspend fun deleteById(id: String)
 }

@@ -10,15 +10,23 @@ import com.example.ai.ExtendedOcrMetadata
 import com.example.data.DskLockerRepository
 import com.example.data.local.*
 import com.example.data.remote.BackendConfig
+import com.example.data.remote.CloudBackupFilesResponseDto
+import com.example.data.remote.CloudBackupHistoryResponseDto
+import com.example.data.remote.CloudBackupStatusDto
 import com.example.data.remote.FetchedLinkMetadata
+import com.example.data.remote.PhoneOtpStartResult
 import com.example.security.BiometricAvailability
 import com.example.security.BiometricHelper
+import com.example.storage.ConnectivityBackupMonitor
 import com.example.storage.DeviceStorageStats
 import com.example.storage.LocalFileManager
+import com.example.storage.NetworkStatusHelper
+import com.google.firebase.auth.PhoneAuthProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import java.io.File
 
 enum class AuthStage {
     CREATE_MPIN,
@@ -115,6 +123,39 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _restoreProgress = MutableStateFlow<Pair<String, Float>?>(null)
     val restoreProgress: StateFlow<Pair<String, Float>?> = _restoreProgress.asStateFlow()
 
+    private val _backupProgress = MutableStateFlow<Pair<String, Float>?>(null)
+    val backupProgress: StateFlow<Pair<String, Float>?> = _backupProgress.asStateFlow()
+
+    private val _isOnline = MutableStateFlow(
+        runCatching { NetworkStatusHelper.isNetworkConnected(application) }.getOrDefault(false)
+    )
+    val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
+
+    private val _cloudBackupStatus = MutableStateFlow<CloudBackupStatusDto?>(null)
+    val cloudBackupStatus: StateFlow<CloudBackupStatusDto?> = _cloudBackupStatus.asStateFlow()
+
+    private val _cloudRestorePreview = MutableStateFlow<CloudBackupFilesResponseDto?>(null)
+    val cloudRestorePreview: StateFlow<CloudBackupFilesResponseDto?> = _cloudRestorePreview.asStateFlow()
+
+    private val _cloudHistory = MutableStateFlow<CloudBackupHistoryResponseDto?>(null)
+    val cloudHistory: StateFlow<CloudBackupHistoryResponseDto?> = _cloudHistory.asStateFlow()
+
+    private val _cloudAuthLoading = MutableStateFlow(false)
+    val cloudAuthLoading: StateFlow<Boolean> = _cloudAuthLoading.asStateFlow()
+
+    private val _cloudAuthError = MutableStateFlow<String?>(null)
+    val cloudAuthError: StateFlow<String?> = _cloudAuthError.asStateFlow()
+
+    private val _otpPendingPhone = MutableStateFlow<String?>(null)
+    val otpPendingPhone: StateFlow<String?> = _otpPendingPhone.asStateFlow()
+
+    private val _otpVerificationId = MutableStateFlow<String?>(null)
+    val otpVerificationId: StateFlow<String?> = _otpVerificationId.asStateFlow()
+
+    private var otpResendToken: PhoneAuthProvider.ForceResendingToken? = null
+
+    private var connectivityMonitor: ConnectivityBackupMonitor? = null
+
     // Reactive Database Flows
     val activeFiles = repo.activeFiles.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val vaultFiles = repo.vaultFiles.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -138,7 +179,30 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
             _storageStats.value = runCatching { repo.getStorageStats() }
                 .getOrDefault(DeviceStorageStats(0L, 0L, 0L))
             runCatching { startLockoutCountdownIfNeeded() }
+            runCatching { repo.recoverInterruptedBackups() }
         }
+        runCatching {
+            val monitor = ConnectivityBackupMonitor(
+                context = application.applicationContext ?: application,
+                onConnectivityChanged = { connected -> _isOnline.value = connected },
+                onReconnectSyncReady = {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        if (repo.hasFirebaseSession() && BackendConfig.isSqlBackendConfigured) {
+                            repo.runNeonCloudBackup(isManual = false)
+                            refreshCloudBackupDashboard()
+                        }
+                    }
+                }
+            )
+            monitor.start()
+            connectivityMonitor = monitor
+        }
+    }
+
+    override fun onCleared() {
+        runCatching { connectivityMonitor?.stop() }
+        connectivityMonitor = null
+        super.onCleared()
     }
 
     fun clearBanner() {
@@ -174,11 +238,15 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun isSqlBackendConfigured(): Boolean = BackendConfig.isSqlBackendConfigured
 
+    fun cloudBackendConfigurationIssue(): String? = BackendConfig.configurationIssue
+
     fun firebaseUidDisplay(): String = repo.currentFirebaseUid() ?: "Local MPIN Vault"
 
     fun ownerPhoneDisplay(): String = repo.prefs.ownerPhone?.takeIf { it.isNotBlank() } ?: "MPIN Protected Owner"
 
-    fun lastBackupMs(): Long = repo.prefs.lastBackupMs
+    fun lastBackupMs(): Long = _cloudBackupStatus.value?.lastBackupAt ?: repo.prefs.lastBackupMs
+
+    suspend fun resolveReadableFile(file: FileItemEntity): File? = repo.resolveReadableFile(file)
 
     fun logout() {
         viewModelScope.launch {
@@ -752,7 +820,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     fun downloadFileToPhone(file: FileItemEntity, onDone: (String) -> Unit) {
         viewModelScope.launch {
             _downloadProgress.value = 0.05f
-            val readable = LocalFileManager.resolveReadableFile(getApplication(), file)
+            val readable = repo.resolveReadableFile(file)
             if (readable == null) {
                 _downloadProgress.value = null
                 _statusBanner.value = "File is Cloud Only. Restore to phone first."
@@ -780,7 +848,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     fun exportFileToSafUri(file: FileItemEntity, targetUri: Uri) {
         viewModelScope.launch {
             _downloadProgress.value = 0.05f
-            val readable = LocalFileManager.resolveReadableFile(getApplication(), file)
+            val readable = repo.resolveReadableFile(file)
             if (readable == null) {
                 _downloadProgress.value = null
                 _statusBanner.value = "Local file missing. Restore first."
@@ -799,32 +867,191 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    // --- Backup & Restore ---
-    fun runManualBackupNow(selected: List<FileItemEntity>? = null) {
-        viewModelScope.launch {
-            _isRefreshing.value = true
-            val (ok, fail) = repo.runManualBackup(selected)
-            _isRefreshing.value = false
-            _statusBanner.value = if (!repo.hasFirebaseSession()) {
-                "Cloud backup session unavailable. Local files & backup queue remain safe."
-            } else {
-                "Firebase Storage backup complete: $ok uploaded, $fail pending/failed."
+    // --- Neon Cloud Backup & Restore + Phone OTP Recovery Login ---
+    fun sendCloudOtp(activity: Activity, rawPhoneInput: String, isResend: Boolean = false) {
+        val cleaned = rawPhoneInput.trim().replace(" ", "").let {
+            when {
+                it.startsWith("+") -> it
+                it.length == 10 && it.all { ch -> ch.isDigit() } -> "+91$it"
+                else -> it
+            }
+        }
+        if (cleaned.length < 10 || !cleaned.startsWith("+")) {
+            _cloudAuthError.value = "Enter a valid phone number with country code (e.g. +919876543210)."
+            return
+        }
+        _cloudAuthError.value = null
+        _cloudAuthLoading.value = true
+        _otpPendingPhone.value = cleaned
+        repo.startFirebasePhoneOtp(
+            activity = activity,
+            phoneE164 = cleaned,
+            resendToken = if (isResend) otpResendToken else null
+        ) { res ->
+            when (res) {
+                is PhoneOtpStartResult.CodeSent -> {
+                    _otpVerificationId.value = res.verificationId
+                    otpResendToken = res.resendToken
+                    _cloudAuthLoading.value = false
+                }
+                is PhoneOtpStartResult.AutoVerified -> {
+                    viewModelScope.launch {
+                        val session = com.example.data.remote.FirebaseSessionUser(
+                            uid = res.uid,
+                            phoneNumber = res.phoneNumber,
+                            idToken = res.idToken
+                        )
+                        val fin = repo.finalizeFirebaseOwnerSession(session)
+                        _cloudAuthLoading.value = false
+                        if (fin.isSuccess) {
+                            _otpVerificationId.value = null
+                            _otpPendingPhone.value = null
+                            _statusBanner.value = "Cloud account verified (${res.phoneNumber})."
+                            refreshCloudBackupDashboard()
+                        } else {
+                            _cloudAuthError.value = fin.exceptionOrNull()?.localizedMessage ?: "Cloud verification rejected."
+                        }
+                    }
+                }
+                is PhoneOtpStartResult.Error -> {
+                    _cloudAuthLoading.value = false
+                    _cloudAuthError.value = res.message
+                }
             }
         }
     }
 
-    fun restoreCloudFiles(files: List<FileItemEntity>, overwrite: Boolean) {
+    fun verifyCloudOtp(otpCode: String) {
+        val verId = _otpVerificationId.value
+        val phone = _otpPendingPhone.value
+        if (verId.isNullOrBlank() || phone.isNullOrBlank()) {
+            _cloudAuthError.value = "Request an OTP first."
+            return
+        }
+        if (otpCode.trim().length < 6) {
+            _cloudAuthError.value = "Enter the 6-digit OTP code."
+            return
+        }
+        _cloudAuthLoading.value = true
+        _cloudAuthError.value = null
         viewModelScope.launch {
-            _restoreProgress.value = "Preparing restore..." to 0f
-            val res = repo.restoreFromCloud(files, overwrite) { name, pct ->
+            val res = repo.verifyFirebaseOtp(verId, otpCode.trim(), phone)
+            _cloudAuthLoading.value = false
+            if (res.isSuccess) {
+                _otpVerificationId.value = null
+                _otpPendingPhone.value = null
+                _statusBanner.value = "Cloud account connected (${res.getOrThrow().phoneNumber})."
+                refreshCloudBackupDashboard()
+            } else {
+                _cloudAuthError.value = res.exceptionOrNull()?.localizedMessage ?: "OTP verification failed."
+            }
+        }
+    }
+
+    fun cancelCloudOtp() {
+        _otpVerificationId.value = null
+        _otpPendingPhone.value = null
+        _cloudAuthError.value = null
+        _cloudAuthLoading.value = false
+    }
+
+    fun refreshCloudBackupDashboard() {
+        viewModelScope.launch {
+            if (!BackendConfig.isSqlBackendConfigured || !repo.hasFirebaseSession()) return@launch
+            repo.fetchCloudStatus().onSuccess { _cloudBackupStatus.value = it }
+            repo.fetchCloudFilesSnapshot().onSuccess { _cloudRestorePreview.value = it }
+            repo.fetchCloudHistory().onSuccess { _cloudHistory.value = it }
+        }
+    }
+
+    suspend fun verifyMpinForRestoreAndKeyRecovery(mpin: String): Result<Unit> {
+        val res = repo.verifyMpinWithBackendIfLinked(mpin, purpose = "RESTORE_RECOVERY")
+        if (res.isFailure) {
+            val penalty = repo.prefs.recordFailedAttempt()
+            if (penalty > 0) startLockoutCountdownIfNeeded()
+        } else {
+            repo.prefs.resetFailedAttempts()
+            _lockoutSeconds.value = 0
+        }
+        return res
+    }
+
+    fun runManualBackupNow(selected: List<FileItemEntity>? = null) {
+        viewModelScope.launch {
+            _isRefreshing.value = true
+            _backupProgress.value = "Preparing Neon backup..." to 0.05f
+            val summary = repo.runNeonCloudBackup(
+                filesToBackup = selected,
+                isManual = true
+            ) { name, pct ->
+                _backupProgress.value = name to pct
+            }
+            _backupProgress.value = null
+            _isRefreshing.value = false
+            _storageStats.value = repo.getStorageStats()
+            refreshCloudBackupDashboard()
+            _statusBanner.value = when {
+                !BackendConfig.isSqlBackendConfigured ->
+                    BackendConfig.configurationIssue ?: "Configure BACKEND_API_URL for Render + Neon Cloud Backup."
+                !repo.hasFirebaseSession() ->
+                    "Cloud account not signed in. Files queued safely as BACKUP_PENDING."
+                summary.notice != null && summary.uploadedCount == 0 ->
+                    summary.notice
+                else ->
+                    buildString {
+                        append("Neon Cloud Backup: ${summary.uploadedCount} uploaded, ${summary.failedCount} failed.")
+                        if (!summary.notice.isNullOrBlank()) append(" ${summary.notice}")
+                    }
+            }
+        }
+    }
+
+    fun restoreCloudFiles(
+        files: List<FileItemEntity>,
+        overwrite: Boolean,
+        verifiedMpinForKeyRecovery: String? = null
+    ) {
+        viewModelScope.launch {
+            _restoreProgress.value = "Preparing Neon restore..." to 0.05f
+            val res = repo.restoreFromCloud(
+                files = files,
+                overwriteExisting = overwrite,
+                verifiedMpinForKeyRecovery = verifiedMpinForKeyRecovery
+            ) { name, pct ->
                 _restoreProgress.value = name to pct
             }
             _restoreProgress.value = null
             _storageStats.value = repo.getStorageStats()
+            refreshCloudBackupDashboard()
             if (res.isSuccess) {
-                _statusBanner.value = "Restored ${res.getOrThrow()} file(s) with SHA-256 verification."
+                _statusBanner.value = "Restored ${res.getOrThrow()} file(s) from Neon PostgreSQL with SHA-256 verification."
             } else {
                 _statusBanner.value = res.exceptionOrNull()?.localizedMessage ?: "Restore failed."
+            }
+        }
+    }
+
+    fun restoreFullAccountBackup(
+        fileIds: List<String>? = null,
+        overwrite: Boolean = false,
+        verifiedMpinForKeyRecovery: String? = null
+    ) {
+        viewModelScope.launch {
+            _restoreProgress.value = "Fetching Neon backup manifest..." to 0.05f
+            val res = repo.restoreFullFromNeon(
+                fileIds = fileIds,
+                overwriteExisting = overwrite,
+                verifiedMpinForKeyRecovery = verifiedMpinForKeyRecovery
+            ) { name, pct ->
+                _restoreProgress.value = name to pct
+            }
+            _restoreProgress.value = null
+            _storageStats.value = repo.getStorageStats()
+            refreshCloudBackupDashboard()
+            if (res.isSuccess) {
+                _statusBanner.value = res.getOrThrow().notice
+            } else {
+                _statusBanner.value = res.exceptionOrNull()?.localizedMessage ?: "Cloud restore failed."
             }
         }
     }
@@ -835,6 +1062,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
             _isRefreshing.value = true
             val res = repo.refreshWorkspace()
             _storageStats.value = repo.getStorageStats()
+            refreshCloudBackupDashboard()
             _isRefreshing.value = false
             if (!silent) {
                 _statusBanner.value = if (res.isSuccess) {

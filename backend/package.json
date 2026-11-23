@@ -3,10 +3,14 @@
   "version": "1.0.0",
   "description": "DSK LOCKER Secure SQL Backend API with Firebase Admin ID Token verification & single-owner authorization",
   "main": "dist/server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+    "test": "tsx --test tests/backup.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

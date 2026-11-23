@@ -5,10 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -19,22 +24,15 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.example.R
-import com.example.data.local.BackupHistoryEntity
-import com.example.data.local.BackupStatus
-import com.example.data.local.DskCategories
+import com.example.data.DskLockerRepository
 import com.example.data.local.DskLockerDatabase
-import com.example.data.remote.FirebasePhoneAuthManager
-import com.example.data.remote.FirebaseStorageManager
-import com.example.data.remote.FirebaseStoragePaths
-import com.example.data.remote.SqlBackendClient
-import com.example.security.CryptoManager
-import com.example.security.SecurePrefs
-import org.json.JSONObject
-import java.io.File
+import com.example.data.remote.BackendConfig
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class AutoBackupWorker(
@@ -43,139 +41,19 @@ class AutoBackupWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
-        val db = DskLockerDatabase.getInstance(applicationContext)
-        val prefs = SecurePrefs(applicationContext)
-        val settings = db.profileSettingsDao().getSettingsOnce()
-        val authManager = FirebasePhoneAuthManager()
-        val firebaseUser = authManager.currentUser()
-        val uid = firebaseUser?.uid ?: return Result.success()
-        val idToken = authManager.getFreshIdToken(false).orEmpty()
-
-        val storage = FirebaseStorageManager()
-        val sqlClient = SqlBackendClient()
-        val pendingFiles = db.fileItemDao().getPendingBackupFiles()
-        val folderMap = db.folderDao().getFoldersOnce().associateBy { it.id }
-
-        for (fileItem in pendingFiles) {
-            val isManual = inputData.getBoolean("manual", false)
-            if (!isManual) {
-                val folderDisabled = fileItem.folderId?.let { folderMap[it]?.isAutoBackupEnabled == false } == true
-                if (folderDisabled) continue
-                if (settings != null) {
-                    val allowCat = when (fileItem.categoryId) {
-                        DskCategories.CAT_PHOTOS -> settings.backupPhotos
-                        DskCategories.CAT_VIDEOS -> settings.backupVideos
-                        DskCategories.CAT_PDF, DskCategories.CAT_WORD, DskCategories.CAT_EXCEL,
-                        DskCategories.CAT_TEXT, DskCategories.CAT_PERSONAL_RECORDS -> settings.backupDocuments
-                        else -> true
-                    }
-                    if (!allowCat) continue
-                }
-            }
-
-            val localFile = fileItem.localPath?.let { File(it) }
-            if (localFile == null || !localFile.exists()) continue
-
-            val cloudPath = FirebaseStoragePaths.buildPrivateObjectPath(
-                firebaseUid = uid,
-                fileId = fileItem.id,
-                originalFilename = fileItem.originalFilename,
-                categoryId = fileItem.categoryId,
-                isInVault = fileItem.isInVault
-            )
-            val bytes = localFile.readBytes()
-            val checksum = if (fileItem.isInVault) CryptoManager.sha256Bytes(bytes) else fileItem.sha256
-            val uploadRes = storage.uploadBytes(
-                objectPath = cloudPath,
-                bytes = bytes,
-                mimeType = if (fileItem.isInVault) "application/octet-stream" else fileItem.mimeType,
-                sha256 = checksum
-            )
-
-            if (uploadRes.isSuccess) {
-                val bucket = storage.bucketName()
-                val updated = fileItem.copy(
-                    cloudPath = cloudPath,
-                    cloudBucket = bucket,
-                    backupStatus = BackupStatus.MOBILE_AND_CLOUD,
-                    updatedAt = System.currentTimeMillis()
-                )
-                db.fileItemDao().upsert(updated)
-
-                if (idToken.isNotBlank()) {
-                    val metaJson = JSONObject()
-                        .put("id", updated.id)
-                        .put("original_filename", updated.originalFilename)
-                        .put("display_name", updated.displayName)
-                        .put("category_id", updated.categoryId)
-                        .put("folder_id", updated.folderId)
-                        .put("mime_type", updated.mimeType)
-                        .put("size_bytes", updated.sizeBytes)
-                        .put("cloud_path", cloudPath)
-                        .put("cloud_bucket", bucket)
-                        .put("backup_status", updated.backupStatus.name)
-                        .put("sha256", checksum)
-                        .put("is_favorite", updated.isFavorite)
-                        .put("is_in_vault", updated.isInVault)
-                        .put("is_deleted", updated.isDeleted)
-                        .put("created_at", updated.createdAt)
-                        .put("updated_at", updated.updatedAt)
-                    sqlClient.upsertRow("files", idToken, metaJson)
-
-                    sqlClient.upsertRow(
-                        "file_versions",
-                        idToken,
-                        JSONObject()
-                            .put("id", UUID.randomUUID().toString())
-                            .put("file_id", updated.id)
-                            .put("version_number", 1)
-                            .put("cloud_path", cloudPath)
-                            .put("size_bytes", updated.sizeBytes)
-                            .put("sha256", checksum)
-                            .put("created_at", updated.updatedAt)
-                    )
-                }
-
-                val history = BackupHistoryEntity(
-                    fileId = updated.id,
-                    fileName = updated.displayName,
-                    action = if (isManual) "MANUAL_BACKUP" else "AUTO_BACKUP",
-                    status = "SUCCESS",
-                    bytesTransferred = updated.sizeBytes,
-                    message = "Uploaded to Firebase Storage ($cloudPath) & verified SHA-256."
-                )
-                db.backupHistoryDao().insert(history)
-                if (idToken.isNotBlank()) {
-                    sqlClient.upsertRow(
-                        "backup_history",
-                        idToken,
-                        JSONObject()
-                            .put("id", history.id)
-                            .put("file_id", history.fileId)
-                            .put("file_name", history.fileName)
-                            .put("action", history.action)
-                            .put("status", history.status)
-                            .put("bytes_transferred", history.bytesTransferred)
-                            .put("message", history.message)
-                            .put("timestamp", history.timestamp)
-                    )
-                }
-                prefs.lastBackupMs = System.currentTimeMillis()
-            } else {
-                val err = uploadRes.exceptionOrNull()?.localizedMessage ?: "Firebase Storage upload failed"
-                db.fileItemDao().upsert(fileItem.copy(backupStatus = BackupStatus.BACKUP_FAILED))
-                db.backupHistoryDao().insert(
-                    BackupHistoryEntity(
-                        fileId = fileItem.id,
-                        fileName = fileItem.displayName,
-                        action = if (isManual) "MANUAL_BACKUP" else "AUTO_BACKUP",
-                        status = "FAILED",
-                        message = err
-                    )
-                )
-            }
+        if (!BackendConfig.isSqlBackendConfigured) {
+            return Result.success()
         }
-        return Result.success()
+        val repo = DskLockerRepository(applicationContext)
+        val isManual = inputData.getBoolean("manual", false)
+        val summary = repo.runNeonCloudBackup(isManual = isManual)
+
+        // If transient offline/network error occurred and attempts remain, ask WorkManager to retry cleanly
+        return if (summary.transientRetryNeeded && runAttemptCount < 4) {
+            Result.retry()
+        } else {
+            Result.success()
+        }
     }
 }
 
@@ -262,9 +140,71 @@ object DskNotificationHelper {
     }
 }
 
+object NetworkStatusHelper {
+    fun isNetworkConnected(context: Context): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val active = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(active) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    fun isWifiConnected(context: Context): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val active = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(active) ?: return false
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+}
+
+class ConnectivityBackupMonitor(
+    private val context: Context,
+    private val onConnectivityChanged: (Boolean) -> Unit,
+    private val onReconnectSyncReady: () -> Unit
+) {
+    private val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    private var callback: ConnectivityManager.NetworkCallback? = null
+
+    fun start() {
+        val manager = cm ?: return
+        onConnectivityChanged(NetworkStatusHelper.isNetworkConnected(context))
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                onConnectivityChanged(true)
+                CoroutineScope(Dispatchers.IO).launch {
+                    val db = DskLockerDatabase.getInstance(context)
+                    val settings = db.profileSettingsDao().getSettingsOnce()
+                    val pending = db.fileItemDao().getPendingBackupFiles()
+                    if (settings?.autoBackupEnabled == true && pending.isNotEmpty()) {
+                        val wifiOk = !settings.wifiOnly || NetworkStatusHelper.isWifiConnected(context)
+                        if (wifiOk) {
+                            onReconnectSyncReady()
+                        }
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                onConnectivityChanged(NetworkStatusHelper.isNetworkConnected(context))
+            }
+        }
+        callback = cb
+        val req = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        runCatching { manager.registerNetworkCallback(req, cb) }
+    }
+
+    fun stop() {
+        val manager = cm ?: return
+        callback?.let { runCatching { manager.unregisterNetworkCallback(it) } }
+        callback = null
+    }
+}
+
 object BackupScheduler {
     fun schedulePeriodicAutoBackup(context: Context, enabled: Boolean, wifiOnly: Boolean) {
-        val wm = WorkManager.getInstance(context)
+        val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
         if (!enabled) {
             wm.cancelUniqueWork("dsk_periodic_backup")
             return
@@ -275,6 +215,7 @@ object BackupScheduler {
             .build()
         val request = PeriodicWorkRequestBuilder<AutoBackupWorker>(6, TimeUnit.HOURS)
             .setConstraints(constraints)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
         wm.enqueueUniquePeriodicWork(
             "dsk_periodic_backup",
@@ -284,11 +225,13 @@ object BackupScheduler {
     }
 
     fun enqueueImmediateBackup(context: Context, wifiOnly: Boolean) {
+        val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
         val netType = if (wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED
         val req = OneTimeWorkRequestBuilder<AutoBackupWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(netType).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 20, TimeUnit.SECONDS)
             .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(
+        wm.enqueueUniqueWork(
             "dsk_manual_backup",
             ExistingWorkPolicy.REPLACE,
             req
@@ -296,8 +239,9 @@ object BackupScheduler {
     }
 
     fun scheduleDailyExpiryCheck(context: Context) {
+        val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
         val req = PeriodicWorkRequestBuilder<ExpiryReminderWorker>(12, TimeUnit.HOURS).build()
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+        wm.enqueueUniquePeriodicWork(
             "dsk_expiry_reminders",
             ExistingPeriodicWorkPolicy.KEEP,
             req

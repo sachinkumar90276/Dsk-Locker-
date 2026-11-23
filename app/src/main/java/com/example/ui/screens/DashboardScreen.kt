@@ -486,7 +486,7 @@ fun DashboardScreen(
                 Spacer(modifier = Modifier.height(12.dp))
                 MetricLine("DSK Locker Local Storage", LocalFileManager.formatBytes(mobileStorageBytes), ElectricBlue)
                 Spacer(modifier = Modifier.height(6.dp))
-                MetricLine("Firebase Storage Cloud", LocalFileManager.formatBytes(cloudStorageBytes), NeonViolet)
+                MetricLine("Neon Cloud Backup", LocalFileManager.formatBytes(cloudStorageBytes), NeonViolet)
                 Spacer(modifier = Modifier.height(6.dp))
                 MetricLine("Device Free Space", LocalFileManager.formatBytes(storageStats.deviceAvailableBytes), EmeraldSync)
                 Spacer(modifier = Modifier.height(6.dp))

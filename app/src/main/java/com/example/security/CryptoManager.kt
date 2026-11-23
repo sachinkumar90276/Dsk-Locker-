@@ -84,9 +84,20 @@ object CryptoManager {
         }
     }
 
-    fun encryptStream(input: InputStream, output: OutputStream) {
+    fun generatePortableAesKeyBase64(): String {
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        return Base64.encodeToString(key.encoded, Base64.NO_WRAP)
+    }
+
+    fun secretKeyFromBase64(keyBase64: String): SecretKey {
+        val raw = Base64.decode(keyBase64, Base64.NO_WRAP)
+        require(raw.size == 16 || raw.size == 24 || raw.size == 32) { "Invalid AES key length." }
+        return javax.crypto.spec.SecretKeySpec(raw, "AES")
+    }
+
+    fun encryptStreamWithKey(key: SecretKey, input: InputStream, output: OutputStream) {
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateMasterKey())
+        cipher.init(Cipher.ENCRYPT_MODE, key)
         val iv = cipher.iv
         output.write(iv.size)
         output.write(iv)
@@ -95,7 +106,7 @@ object CryptoManager {
         }
     }
 
-    fun decryptStream(input: InputStream, output: OutputStream) {
+    fun decryptStreamWithKey(key: SecretKey, input: InputStream, output: OutputStream) {
         val ivLen = input.read()
         require(ivLen in 8..32) { "Invalid encrypted vault header." }
         val iv = ByteArray(ivLen)
@@ -106,10 +117,18 @@ object CryptoManager {
             readTotal += n
         }
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, getOrCreateMasterKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
         CipherInputStream(input, cipher).use { cis ->
             cis.copyTo(output, bufferSize = 16 * 1024)
         }
+    }
+
+    fun encryptStream(input: InputStream, output: OutputStream) {
+        encryptStreamWithKey(getOrCreateMasterKey(), input, output)
+    }
+
+    fun decryptStream(input: InputStream, output: OutputStream) {
+        decryptStreamWithKey(getOrCreateMasterKey(), input, output)
     }
 
     fun generateSaltBase64(): String {

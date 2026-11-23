@@ -156,3 +156,32 @@ data class UserSettingsEntity(
     val accentPreset: String = "ELECTRIC_COSMOS",
     val notificationsEnabled: Boolean = true
 )
+
+@Entity(tableName = "backup_snapshots")
+data class BackupSnapshotEntity(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val backupType: String = "MANUAL", // AUTO, MANUAL, RECONNECT, RESTORE
+    val status: String = "SYNCING", // SYNCING, SUCCESS, PARTIAL, FAILED
+    val totalFiles: Int = 0,
+    val backedUpFiles: Int = 0,
+    val failedFiles: Int = 0,
+    val totalBytes: Long = 0L,
+    val summaryMessage: String = "",
+    val deviceInfo: String = "",
+    val startedAt: Long = System.currentTimeMillis(),
+    val completedAt: Long? = null
+)
+
+@Entity(tableName = "pending_sync_ops")
+data class PendingSyncOpEntity(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val opType: String, // UPLOAD_FILE, UPSERT_ROW, DELETE_CLOUD_FILE, DELETE_ROW
+    val tableName: String,
+    val targetId: String,
+    val payloadJson: String = "{}",
+    val retryCount: Int = 0,
+    val lastError: String? = null,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis()
+)
+

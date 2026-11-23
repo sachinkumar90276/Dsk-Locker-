@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: dsk-locker-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: PG_SSL
+        value: auto
+      - key: NEON_FREE_TIER_LIMIT_MB
+        value: "512"
+      - key: DEFAULT_USER_QUOTA_MB
+        value: "450"
+      - key: MAX_BACKUP_FILE_MB
+        value: "20"
+      - key: DATABASE_URL
+        sync: false
+      - key: VAULT_MASTER_SECRET
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: AUTHORIZED_OWNER_PHONE
+        sync: false
+      - key: OWNER_FIREBASE_UID
+        sync: false

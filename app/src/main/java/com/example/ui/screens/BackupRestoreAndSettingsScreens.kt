@@ -1,11 +1,11 @@
 package com.example.ui.screens
 
+import android.app.Activity
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
@@ -25,16 +26,15 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.fragment.app.FragmentActivity
 import coil.compose.AsyncImage
-import com.example.R
 import com.example.data.local.*
 import com.example.data.remote.SqlSchemaViewerData
 import com.example.security.BiometricAvailability
@@ -43,40 +43,143 @@ import com.example.storage.LocalFileManager
 import com.example.ui.DskLockerViewModel
 import com.example.ui.components.*
 import com.example.ui.theme.*
+import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+private data class RestoreDisplayRow(
+    val fileId: String,
+    val displayName: String,
+    val categoryId: String,
+    val sizeBytes: Long,
+    val isInVault: Boolean,
+    val backupStatus: BackupStatus,
+    val hasLocalCopy: Boolean
+)
 
 @Composable
 fun BackupRestoreScreen(
     viewModel: DskLockerViewModel,
     onBack: (() -> Unit)? = null
 ) {
+    val context = LocalContext.current
+    val activity = context as? Activity
+    val scope = rememberCoroutineScope()
+
     val activeFiles by viewModel.activeFiles.collectAsState()
     val vaultFiles by viewModel.vaultFiles.collectAsState()
     val folders by viewModel.folders.collectAsState()
+    val activeNotes by viewModel.activeNotes.collectAsState()
     val settingsState by viewModel.settings.collectAsState()
     val history by viewModel.backupHistory.collectAsState()
+    val backupProgress by viewModel.backupProgress.collectAsState()
     val restoreProgress by viewModel.restoreProgress.collectAsState()
-    val settings = settingsState ?: UserSettingsEntity()
+    val isOnline by viewModel.isOnline.collectAsState()
+    val cloudStatus by viewModel.cloudBackupStatus.collectAsState()
+    val cloudRestorePreview by viewModel.cloudRestorePreview.collectAsState()
+    val cloudHistory by viewModel.cloudHistory.collectAsState()
+    val cloudAuthLoading by viewModel.cloudAuthLoading.collectAsState()
+    val cloudAuthError by viewModel.cloudAuthError.collectAsState()
+    val otpVerificationId by viewModel.otpVerificationId.collectAsState()
+    val otpPendingPhone by viewModel.otpPendingPhone.collectAsState()
+    val lockoutSeconds by viewModel.lockoutSeconds.collectAsState()
 
-    val allFiles = activeFiles + vaultFiles
-    val cloudBackedFiles = remember(allFiles) { allFiles.filter { !it.cloudPath.isNullOrBlank() } }
-    val failedFiles = remember(allFiles) { allFiles.filter { it.backupStatus == BackupStatus.BACKUP_FAILED } }
-    val pendingFiles = remember(allFiles) {
-        allFiles.filter {
+    val settings = settingsState ?: UserSettingsEntity()
+    val configIssue = viewModel.cloudBackendConfigurationIssue()
+    val hasCloudSession = viewModel.isFirebaseSessionActive()
+
+    LaunchedEffect(hasCloudSession) {
+        viewModel.refreshCloudBackupDashboard()
+    }
+
+    val allLocalFiles = activeFiles + vaultFiles
+    val localMap = remember(allLocalFiles) { allLocalFiles.associateBy { it.id } }
+    val remoteFiles = cloudRestorePreview?.files.orEmpty()
+
+    val cloudBackedRows = remember(allLocalFiles, remoteFiles) {
+        val merged = linkedMapOf<String, RestoreDisplayRow>()
+        remoteFiles.forEach { rf ->
+            val local = localMap[rf.fileId]
+            val localExists = local?.localPath?.let { File(it).exists() } == true
+            merged[rf.fileId] = RestoreDisplayRow(
+                fileId = rf.fileId,
+                displayName = rf.displayName,
+                categoryId = rf.categoryId,
+                sizeBytes = rf.sizeBytes,
+                isInVault = rf.isInVault,
+                backupStatus = if (localExists) BackupStatus.MOBILE_AND_CLOUD else BackupStatus.CLOUD_ONLY,
+                hasLocalCopy = localExists
+            )
+        }
+        allLocalFiles.filter { !it.cloudPath.isNullOrBlank() }.forEach { lf ->
+            if (!merged.containsKey(lf.id)) {
+                merged[lf.id] = RestoreDisplayRow(
+                    fileId = lf.id,
+                    displayName = lf.displayName,
+                    categoryId = lf.categoryId,
+                    sizeBytes = lf.sizeBytes,
+                    isInVault = lf.isInVault,
+                    backupStatus = lf.backupStatus,
+                    hasLocalCopy = lf.localPath?.let { File(it).exists() } == true
+                )
+            }
+        }
+        merged.values.toList()
+    }
+
+    val failedFiles = remember(allLocalFiles) { allLocalFiles.filter { it.backupStatus == BackupStatus.BACKUP_FAILED } }
+    val pendingFiles = remember(allLocalFiles) {
+        allLocalFiles.filter {
             it.backupStatus == BackupStatus.MOBILE_ONLY ||
                 it.backupStatus == BackupStatus.BACKUP_PENDING ||
                 it.backupStatus == BackupStatus.BACKUP_FAILED
         }
     }
+    val localBackedCount = remember(allLocalFiles) {
+        allLocalFiles.count { !it.cloudPath.isNullOrBlank() || it.backupStatus == BackupStatus.MOBILE_AND_CLOUD }
+    }
+    val totalDocsCount = maxOf(allLocalFiles.size, cloudStatus?.backedUpFilesCount ?: 0)
+    val backedUpDocsCount = cloudStatus?.backedUpFilesCount ?: maxOf(localBackedCount, cloudBackedRows.size)
+    val totalBackupBytes = cloudStatus?.totalBackupSizeBytes ?: allLocalFiles
+        .filter { !it.cloudPath.isNullOrBlank() }
+        .sumOf { it.sizeBytes }
+    val quotaLimitBytes = cloudStatus?.quotaLimitBytes ?: (450L * 1024L * 1024L)
+    val lastBackupTs = cloudStatus?.lastBackupAt ?: viewModel.lastBackupMs()
 
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Auto & Manual Backup, 1 = Restore System, 2 = History
+    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Backup Dashboard, 1 = Cloud Restore, 2 = History
     var selectedRestoreIds by remember { mutableStateOf(setOf<String>()) }
     var restoreCategoryFilter by remember { mutableStateOf<String?>(null) }
-    var overwriteConfirmTargets by remember { mutableStateOf<List<FileItemEntity>?>(null) }
-    val fmt = remember { SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()) }
+    var showCloudOtpDialog by remember { mutableStateOf(false) }
+    var pendingRestoreIds by remember { mutableStateOf<List<String>?>(null) }
+    var showRestoreMpinGate by remember { mutableStateOf(false) }
+    var pendingVerifiedMpin by remember { mutableStateOf<String?>(null) }
+    var overwriteConfirmIds by remember { mutableStateOf<List<String>?>(null) }
+    var restoreMpinError by remember { mutableStateOf<String?>(null) }
+    val fmt = remember { SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()) }
+
+    LaunchedEffect(hasCloudSession) {
+        if (hasCloudSession && showCloudOtpDialog) {
+            showCloudOtpDialog = false
+        }
+    }
+
+    fun triggerRestoreFlow(targetIds: List<String>?) {
+        val idsToRestore = targetIds
+        val targetRows = if (idsToRestore == null) cloudBackedRows else cloudBackedRows.filter { it.fileId in idsToRestore }
+        val requiresMpinKeyCheck = targetRows.any { it.isInVault } || (cloudStatus?.hasWrappedRecoveryKey == true)
+        if (requiresMpinKeyCheck && viewModel.hasMpin()) {
+            pendingRestoreIds = idsToRestore
+            restoreMpinError = null
+            showRestoreMpinGate = true
+        } else if (targetRows.any { it.hasLocalCopy }) {
+            pendingVerifiedMpin = null
+            overwriteConfirmIds = idsToRestore ?: emptyList()
+        } else {
+            viewModel.restoreFullAccountBackup(fileIds = idsToRestore, overwrite = false, verifiedMpinForKeyRecovery = null)
+        }
+    }
 
     LazyColumn(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 110.dp),
@@ -84,28 +187,152 @@ fun BackupRestoreScreen(
         modifier = Modifier.fillMaxSize()
     ) {
         item {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 if (onBack != null) {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = SilverWhite)
                     }
                 }
-                Column {
-                    Text("CLOUD BACKUP & RESTORE", style = MaterialTheme.typography.headlineMedium, color = SilverWhite)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("NEON CLOUD BACKUP", style = MaterialTheme.typography.headlineMedium, color = SilverWhite)
                     Text(
-                        "${cloudBackedFiles.size} in Cloud • ${pendingFiles.size} Pending • ${failedFiles.size} Failed",
+                        "${if (hasCloudSession) viewModel.ownerPhoneDisplay() else "Not Signed In"} • ${if (isOnline) "Online" else "Offline (Queued)"}",
                         style = MaterialTheme.typography.labelSmall,
-                        color = ElectricBlue
+                        color = if (isOnline && hasCloudSession) EmeraldSync else AmberPending
+                    )
+                }
+                OutlinedButton(
+                    onClick = { showCloudOtpDialog = true },
+                    border = BorderStroke(1.dp, if (hasCloudSession) EmeraldSync else ElectricBlue),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.testTag("cloud_account_connect_button")
+                ) {
+                    Icon(
+                        if (hasCloudSession) Icons.Filled.VerifiedUser else Icons.Filled.PhoneAndroid,
+                        contentDescription = null,
+                        tint = if (hasCloudSession) EmeraldSync else ElectricBlue,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        if (hasCloudSession) "Linked" else "Cloud Login",
+                        fontSize = 11.sp,
+                        color = if (hasCloudSession) EmeraldSync else ElectricBlue
                     )
                 }
             }
         }
 
+        if (configIssue != null) {
+            item {
+                GlassCard4D(glowColor = CrimsonAlert, contentPadding = PaddingValues(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.WarningAmber, contentDescription = null, tint = CrimsonAlert)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("RENDER BACKEND CONFIGURATION REQUIRED", style = MaterialTheme.typography.labelLarge, color = CrimsonAlert)
+                            Text(configIssue, style = MaterialTheme.typography.bodySmall, color = SilverWhite)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cloud Backup Dashboard Metrics Card
+        item {
+            GlassCard4D(glowColor = ElectricBlue, contentPadding = PaddingValues(16.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column {
+                        Text("NEON POSTGRESQL VAULT SYNC", style = MaterialTheme.typography.labelLarge, color = ElectricBlue)
+                        Text(
+                            if (lastBackupTs > 0L) "Last backup: ${fmt.format(Date(lastBackupTs))}" else "Last backup: Never",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MetallicSilver
+                        )
+                    }
+                    Surface(
+                        color = if (settings.autoBackupEnabled) EmeraldSync.copy(alpha = 0.16f) else AmberPending.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, if (settings.autoBackupEnabled) EmeraldSync else AmberPending)
+                    ) {
+                        Text(
+                            if (settings.autoBackupEnabled) "BACKUP ON" else "PAUSED",
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                            color = if (settings.autoBackupEnabled) EmeraldSync else AmberPending,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    CloudMetricTile("Total Docs", "$totalDocsCount", SilverWhite, Modifier.weight(1f))
+                    CloudMetricTile("Backed Up", "$backedUpDocsCount", EmeraldSync, Modifier.weight(1f))
+                    CloudMetricTile("Pending", "${pendingFiles.size}", AmberPending, Modifier.weight(1f))
+                    CloudMetricTile("Failed", "${failedFiles.size}", if (failedFiles.isNotEmpty()) CrimsonAlert else MetallicSilver, Modifier.weight(1f))
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "Cloud Size: ${LocalFileManager.formatBytes(totalBackupBytes)}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = SilverWhite
+                    )
+                    Text(
+                        "Quota: ${LocalFileManager.formatBytes(quotaLimitBytes)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MetallicSilver
+                    )
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                val quotaFraction = if (quotaLimitBytes > 0L) (totalBackupBytes.toFloat() / quotaLimitBytes.toFloat()).coerceIn(0f, 1f) else 0f
+                LinearProgressIndicator(
+                    progress = { quotaFraction },
+                    color = if (quotaFraction > 0.85f) CrimsonAlert else ElectricBlue,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                FilterChip(selected = selectedTab == 0, onClick = { selectedTab = 0 }, label = { Text("Backup Engine") }, modifier = Modifier.weight(1f))
-                FilterChip(selected = selectedTab == 1, onClick = { selectedTab = 1 }, label = { Text("Restore") }, modifier = Modifier.weight(1f))
-                FilterChip(selected = selectedTab == 2, onClick = { selectedTab = 2 }, label = { Text("History") }, modifier = Modifier.weight(1f))
+                FilterChip(selected = selectedTab == 0, onClick = { selectedTab = 0 }, label = { Text("Backup") }, modifier = Modifier.weight(1f))
+                FilterChip(
+                    selected = selectedTab == 1,
+                    onClick = {
+                        selectedTab = 1
+                        viewModel.refreshCloudBackupDashboard()
+                    },
+                    label = { Text("Restore") },
+                    modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = selectedTab == 2,
+                    onClick = {
+                        selectedTab = 2
+                        viewModel.refreshCloudBackupDashboard()
+                    },
+                    label = { Text("History") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        if (backupProgress != null) {
+            item {
+                GlassCard4D(glowColor = EmeraldSync, contentPadding = PaddingValues(14.dp)) {
+                    Text("Backing up ${backupProgress!!.first}", style = MaterialTheme.typography.labelLarge, color = EmeraldSync)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    LinearProgressIndicator(progress = { backupProgress!!.second }, color = EmeraldSync, modifier = Modifier.fillMaxWidth())
+                }
             }
         }
 
@@ -123,21 +350,21 @@ fun BackupRestoreScreen(
             0 -> {
                 item {
                     GlassCard4D(contentPadding = PaddingValues(16.dp)) {
-                        Text("AUTO BACKUP ENGINE", style = MaterialTheme.typography.titleMedium, color = ElectricBlue)
+                        Text("CLOUD BACKUP SETTINGS", style = MaterialTheme.typography.titleMedium, color = ElectricBlue)
                         Spacer(modifier = Modifier.height(8.dp))
-                        SettingSwitchRow("Auto Backup", "Verify SHA-256 & upload in background", settings.autoBackupEnabled) { v ->
+                        SettingSwitchRow("Cloud Backup Enabled", "Sync encrypted documents, OCR, notes & links to Neon", settings.autoBackupEnabled) { v ->
                             viewModel.updateSettings { it.copy(autoBackupEnabled = v) }
                         }
                         SettingSwitchRow("Wi-Fi Only", if (settings.wifiOnly) "Wi-Fi Only enabled" else "Mobile Data allowed", settings.wifiOnly) { v ->
                             viewModel.updateSettings { it.copy(wifiOnly = v) }
                         }
-                        SettingSwitchRow("Photos Backup", "Auto-backup Photos category", settings.backupPhotos) { v ->
+                        SettingSwitchRow("Photos Backup", "Auto-backup Photos & personal images", settings.backupPhotos) { v ->
                             viewModel.updateSettings { it.copy(backupPhotos = v) }
                         }
                         SettingSwitchRow("Videos Backup", "Auto-backup Videos category", settings.backupVideos) { v ->
                             viewModel.updateSettings { it.copy(backupVideos = v) }
                         }
-                        SettingSwitchRow("Documents Backup", "PDF, DOCX, Excel & Personal Records", settings.backupDocuments) { v ->
+                        SettingSwitchRow("Documents Backup", "PDF, DOCX, Excel, OCR & Reminders", settings.backupDocuments) { v ->
                             viewModel.updateSettings { it.copy(backupDocuments = v) }
                         }
                     }
@@ -164,17 +391,20 @@ fun BackupRestoreScreen(
                             colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
                             modifier = Modifier
                                 .weight(1f)
+                                .height(48.dp)
                                 .testTag("manual_backup_now_button")
                         ) {
                             Icon(Icons.Filled.Backup, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Backup Now", fontWeight = FontWeight.Bold)
+                            Text("BACKUP NOW", fontWeight = FontWeight.Bold)
                         }
                         OutlinedButton(
                             onClick = { viewModel.runManualBackupNow(failedFiles) },
                             enabled = failedFiles.isNotEmpty(),
                             border = BorderStroke(1.dp, AmberPending),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
                         ) {
                             Icon(Icons.Filled.Replay, contentDescription = null, tint = AmberPending, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
@@ -185,6 +415,41 @@ fun BackupRestoreScreen(
             }
 
             1 -> {
+                // Cloud Restore Summary Card
+                item {
+                    GlassCard4D(glowColor = NeonViolet, contentPadding = PaddingValues(16.dp)) {
+                        Text("CLOUD RESTORE SUMMARY", style = MaterialTheme.typography.titleMedium, color = NeonViolet)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        val remoteSnap = cloudRestorePreview?.snapshot
+                        val sumFiles = cloudStatus?.backedUpFilesCount ?: cloudBackedRows.size
+                        val sumPhotos = cloudStatus?.photosCount ?: cloudBackedRows.count { it.categoryId == DskCategories.CAT_PHOTOS }
+                        val sumDocs = (cloudStatus?.documentsCount ?: 0) + (cloudStatus?.pdfsCount ?: 0)
+                        val sumNotes = cloudStatus?.notesCount ?: (remoteSnap?.textNotes?.size ?: activeNotes.size)
+                        val sumFolders = cloudStatus?.foldersCount ?: (remoteSnap?.folders?.size ?: folders.size)
+                        Text(
+                            "Backed-up Files: $sumFiles • Photos: $sumPhotos • Docs/PDFs: $sumDocs • Notes: $sumNotes • Folders: $sumFolders",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = SilverWhite
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "Backup Size: ${LocalFileManager.formatBytes(totalBackupBytes)} • ${if (lastBackupTs > 0L) "Last: ${fmt.format(Date(lastBackupTs))}" else "Not yet backed up"}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MetallicSilver
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            if (cloudStatus?.hasWrappedRecoveryKey == true) {
+                                "Vault Key Recovery: Wrapped Recovery Key protected by Render backend + MPIN"
+                            } else {
+                                "Vault Key Recovery: Local device key only (non-vault files always restore cleanly)"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (cloudStatus?.hasWrappedRecoveryKey == true) EmeraldSync else AmberPending
+                        )
+                    }
+                }
+
                 item {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         item {
@@ -200,70 +465,79 @@ fun BackupRestoreScreen(
                     }
                 }
 
-                val candidates = cloudBackedFiles.filter {
+                val candidates = cloudBackedRows.filter {
                     restoreCategoryFilter == null || DskCategories.matchesCategory(it.categoryId, restoreCategoryFilter)
                 }
 
                 item {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        Button(
-                            onClick = {
-                                val targets = if (selectedRestoreIds.isNotEmpty()) {
-                                    candidates.filter { it.id in selectedRestoreIds }
-                                } else candidates
-                                if (targets.any { f -> f.localPath != null && File(f.localPath).exists() }) {
-                                    overwriteConfirmTargets = targets
-                                } else {
-                                    viewModel.restoreCloudFiles(targets, overwrite = false)
-                                }
+                    Button(
+                        onClick = {
+                            val targets = if (selectedRestoreIds.isNotEmpty()) {
+                                candidates.filter { it.fileId in selectedRestoreIds }.map { it.fileId }
+                            } else {
+                                null
+                            }
+                            triggerRestoreFlow(targets)
+                        },
+                        enabled = candidates.isNotEmpty() || (cloudStatus?.notesCount ?: 0) > 0 || (cloudStatus?.foldersCount ?: 0) > 0,
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("restore_selected_or_all_button")
+                    ) {
+                        Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            if (selectedRestoreIds.isNotEmpty()) {
+                                "RESTORE SELECTED (${selectedRestoreIds.size})"
+                            } else {
+                                "RESTORE BACKUP (${candidates.size} Files)"
                             },
-                            enabled = candidates.isNotEmpty(),
-                            colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("restore_selected_or_all_button")
-                        ) {
-                            Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(if (selectedRestoreIds.isNotEmpty()) "Restore Selected (${selectedRestoreIds.size})" else "Restore All (${candidates.size})")
-                        }
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
 
                 if (candidates.isEmpty()) {
                     item {
                         DskEmptyStateCard(
-                            title = "No Cloud Backups Found",
-                            subtitle = "Back up files to Firebase Storage to restore them here.",
+                            title = if (hasCloudSession) "No Cloud Backups Found" else "Sign In To Restore",
+                            subtitle = if (hasCloudSession) {
+                                "Tap Backup Now in the Backup tab to back up your files & OCR metadata to Neon PostgreSQL."
+                            } else {
+                                "Tap Cloud Login above using your Phone OTP to fetch your Neon backups after reinstalling."
+                            },
                             icon = Icons.Filled.CloudOff,
                             glowColor = ElectricBlue
                         )
                     }
                 } else {
-                    items(candidates, key = { it.id }) { file ->
-                        val selected = file.id in selectedRestoreIds
+                    items(candidates, key = { it.fileId }) { row ->
+                        val selected = row.fileId in selectedRestoreIds
                         GlassCard4D(
                             glowColor = if (selected) ElectricBlue else NeonViolet,
                             onClick = {
-                                selectedRestoreIds = if (selected) selectedRestoreIds - file.id else selectedRestoreIds + file.id
+                                selectedRestoreIds = if (selected) selectedRestoreIds - row.fileId else selectedRestoreIds + row.fileId
                             },
                             contentPadding = PaddingValues(12.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Checkbox(checked = selected, onCheckedChange = {
-                                    selectedRestoreIds = if (selected) selectedRestoreIds - file.id else selectedRestoreIds + file.id
+                                    selectedRestoreIds = if (selected) selectedRestoreIds - row.fileId else selectedRestoreIds + row.fileId
                                 })
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(file.displayName, style = MaterialTheme.typography.titleMedium, color = SilverWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    BackupStatusBadge(status = file.backupStatus)
-                                }
-                                TextButton(onClick = {
-                                    if (file.localPath != null && File(file.localPath).exists()) {
-                                        overwriteConfirmTargets = listOf(file)
-                                    } else {
-                                        viewModel.restoreCloudFiles(listOf(file), overwrite = false)
+                                    Text(row.displayName, style = MaterialTheme.typography.titleMedium, color = SilverWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        BackupStatusBadge(status = row.backupStatus)
+                                        Text(
+                                            LocalFileManager.formatBytes(row.sizeBytes),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MetallicSilver
+                                        )
                                     }
-                                }) {
+                                }
+                                TextButton(onClick = { triggerRestoreFlow(listOf(row.fileId)) }) {
                                     Text("Restore", color = ElectricBlue)
                                 }
                             }
@@ -273,31 +547,88 @@ fun BackupRestoreScreen(
             }
 
             2 -> {
-                if (history.isEmpty()) {
+                val remoteBackupLogs = cloudHistory?.backups.orEmpty()
+                val remoteRestoreLogs = cloudHistory?.restores.orEmpty()
+                if (remoteRestoreLogs.isNotEmpty()) {
+                    item {
+                        Text("CLOUD RESTORE HISTORY (NEON)", style = MaterialTheme.typography.labelLarge, color = NeonViolet)
+                    }
+                    items(remoteRestoreLogs, key = { "rr_${it.id}" }) { r ->
+                        GlassCard4D(
+                            glowColor = if (r.status == "COMPLETED") EmeraldSync else AmberPending,
+                            contentPadding = PaddingValues(12.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Account Restore (${r.verifiedFiles}/${r.totalFiles} files)", style = MaterialTheme.typography.titleMedium, color = SilverWhite)
+                                    Text(fmt.format(Date(r.startedAt)), style = MaterialTheme.typography.labelSmall, color = MetallicSilver)
+                                    if (r.message.isNotBlank()) {
+                                        Text(r.message, style = MaterialTheme.typography.bodySmall, color = MutedSlate)
+                                    }
+                                }
+                                Text(r.status, style = MaterialTheme.typography.labelLarge, color = if (r.status == "COMPLETED") EmeraldSync else AmberPending)
+                            }
+                        }
+                    }
+                }
+
+                if (history.isEmpty() && remoteBackupLogs.isEmpty() && remoteRestoreLogs.isEmpty()) {
                     item {
                         GlassCard4D(contentPadding = PaddingValues(24.dp)) {
                             Text("No backup or restore events recorded yet.", style = MaterialTheme.typography.bodyMedium, color = MetallicSilver)
                         }
                     }
                 } else {
-                    items(history, key = { it.id }) { entry ->
-                        GlassCard4D(
-                            glowColor = if (entry.status == "SUCCESS") EmeraldSync else CrimsonAlert,
-                            contentPadding = PaddingValues(12.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(entry.fileName, style = MaterialTheme.typography.titleMedium, color = SilverWhite, maxLines = 1)
-                                    Text("${entry.action} • ${fmt.format(Date(entry.timestamp))}", style = MaterialTheme.typography.labelSmall, color = MetallicSilver)
-                                    if (entry.message.isNotBlank()) {
-                                        Text(entry.message, style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = MutedSlate)
+                    if (remoteBackupLogs.isNotEmpty()) {
+                        item {
+                            Text("CLOUD BACKUP HISTORY (NEON)", style = MaterialTheme.typography.labelLarge, color = ElectricBlue)
+                        }
+                        items(remoteBackupLogs, key = { "rb_${it.id}" }) { entry ->
+                            GlassCard4D(
+                                glowColor = if (entry.status == "SUCCESS") EmeraldSync else CrimsonAlert,
+                                contentPadding = PaddingValues(12.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(entry.fileName, style = MaterialTheme.typography.titleMedium, color = SilverWhite, maxLines = 1)
+                                        Text("${entry.action} • ${fmt.format(Date(entry.timestamp))}", style = MaterialTheme.typography.labelSmall, color = MetallicSilver)
+                                        if (entry.message.isNotBlank()) {
+                                            Text(entry.message, style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = MutedSlate)
+                                        }
                                     }
+                                    Text(
+                                        entry.status,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (entry.status == "SUCCESS") EmeraldSync else CrimsonAlert
+                                    )
                                 }
-                                Text(
-                                    entry.status,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = if (entry.status == "SUCCESS") EmeraldSync else CrimsonAlert
-                                )
+                            }
+                        }
+                    }
+
+                    if (history.isNotEmpty()) {
+                        item {
+                            Text("DEVICE QUEUE & BACKUP LOGS", style = MaterialTheme.typography.labelLarge, color = MetallicSilver)
+                        }
+                        items(history, key = { "lh_${it.id}" }) { entry ->
+                            GlassCard4D(
+                                glowColor = if (entry.status == "SUCCESS") EmeraldSync else CrimsonAlert,
+                                contentPadding = PaddingValues(12.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(entry.fileName, style = MaterialTheme.typography.titleMedium, color = SilverWhite, maxLines = 1)
+                                        Text("${entry.action} • ${fmt.format(Date(entry.timestamp))}", style = MaterialTheme.typography.labelSmall, color = MetallicSilver)
+                                        if (entry.message.isNotBlank()) {
+                                            Text(entry.message, style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = MutedSlate)
+                                        }
+                                    }
+                                    Text(
+                                        entry.status,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (entry.status == "SUCCESS") EmeraldSync else CrimsonAlert
+                                    )
+                                }
                             }
                         }
                     }
@@ -306,24 +637,217 @@ fun BackupRestoreScreen(
         }
     }
 
-    overwriteConfirmTargets?.let { targets ->
+    if (showCloudOtpDialog) {
+        var phoneInput by remember { mutableStateOf(otpPendingPhone ?: viewModel.ownerPhoneDisplay().takeIf { it.startsWith("+") } ?: "+91") }
+        var otpCode by remember { mutableStateOf("") }
+        Dialog(onDismissRequest = {
+            viewModel.cancelCloudOtp()
+            showCloudOtpDialog = false
+        }) {
+            GlassCard4D(glowColor = ElectricBlue, contentPadding = PaddingValues(20.dp)) {
+                Text("CLOUD ACCOUNT RECOVERY LOGIN", style = MaterialTheme.typography.titleLarge, color = SilverWhite)
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    if (otpVerificationId == null) {
+                        "Verify your owner phone number via Firebase OTP to link this device with your Neon Cloud Backup."
+                    } else {
+                        "Enter the 6-digit OTP sent to ${otpPendingPhone.orEmpty()}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MetallicSilver
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                if (otpVerificationId == null) {
+                    OutlinedTextField(
+                        value = phoneInput,
+                        onValueChange = { phoneInput = it },
+                        label = { Text("Phone (+91...)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = otpCode,
+                        onValueChange = { if (it.length <= 6) otpCode = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("6-Digit OTP") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                if (cloudAuthError != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(cloudAuthError!!, style = MaterialTheme.typography.labelMedium, color = CrimsonAlert)
+                }
+                Spacer(modifier = Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    TextButton(onClick = {
+                        viewModel.cancelCloudOtp()
+                        showCloudOtpDialog = false
+                    }) { Text("Close") }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    if (otpVerificationId == null) {
+                        Button(
+                            enabled = !cloudAuthLoading && activity != null,
+                            onClick = { activity?.let { viewModel.sendCloudOtp(it, phoneInput) } }
+                        ) {
+                            if (cloudAuthLoading) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            } else {
+                                Text("Send OTP")
+                            }
+                        }
+                    } else {
+                        Button(
+                            enabled = !cloudAuthLoading && otpCode.length == 6,
+                            onClick = {
+                                viewModel.verifyCloudOtp(otpCode)
+                            }
+                        ) {
+                            if (cloudAuthLoading) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            } else {
+                                Text("Verify & Link")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showRestoreMpinGate) {
+        var pinInput by remember { mutableStateOf("") }
+        var verifying by remember { mutableStateOf(false) }
+        val maxPin = viewModel.loginMpinLength()
+        Dialog(onDismissRequest = { if (!verifying) showRestoreMpinGate = false }) {
+            GlassCard4D(glowColor = ElectricBlue, contentPadding = PaddingValues(20.dp)) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("VERIFY MPIN FOR RESTORE", style = MaterialTheme.typography.titleLarge, color = SilverWhite)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "Enter your ${maxPin}-digit Login MPIN to authorize cloud restore & wrapped vault key recovery.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MetallicSilver
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    MpinDots(length = pinInput.length, maxDigits = maxPin, isError = restoreMpinError != null)
+                    if (lockoutSeconds > 0L) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text("Locked out for ${lockoutSeconds}s", color = CrimsonAlert, style = MaterialTheme.typography.labelMedium)
+                    } else if (restoreMpinError != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(restoreMpinError!!, color = CrimsonAlert, style = MaterialTheme.typography.labelMedium)
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    MpinKeypad(
+                        buttonSize = 54.dp,
+                        verticalSpacing = 8.dp,
+                        onDigit = { d ->
+                            if (!verifying && pinInput.length < maxPin) {
+                                restoreMpinError = null
+                                pinInput += d
+                            }
+                        },
+                        onBackspace = {
+                            if (!verifying && pinInput.isNotEmpty()) {
+                                restoreMpinError = null
+                                pinInput = pinInput.dropLast(1)
+                            }
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        enabled = !verifying && lockoutSeconds == 0L && pinInput.length == maxPin,
+                        onClick = {
+                            verifying = true
+                            scope.launch {
+                                val res = viewModel.verifyMpinForRestoreAndKeyRecovery(pinInput)
+                                verifying = false
+                                if (res.isSuccess) {
+                                    showRestoreMpinGate = false
+                                    pendingVerifiedMpin = pinInput
+                                    val ids = pendingRestoreIds
+                                    val targetRows = if (ids == null) cloudBackedRows else cloudBackedRows.filter { it.fileId in ids }
+                                    if (targetRows.any { it.hasLocalCopy }) {
+                                        overwriteConfirmIds = ids ?: emptyList()
+                                    } else {
+                                        viewModel.restoreFullAccountBackup(
+                                            fileIds = ids,
+                                            overwrite = false,
+                                            verifiedMpinForKeyRecovery = pinInput
+                                        )
+                                    }
+                                } else {
+                                    restoreMpinError = res.exceptionOrNull()?.localizedMessage ?: "MPIN verification failed."
+                                    pinInput = ""
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldSync, contentColor = VoidBlack),
+                        modifier = Modifier.fillMaxWidth().height(46.dp)
+                    ) {
+                        Text(if (verifying) "Verifying..." else "Verify & Continue Restore", fontWeight = FontWeight.Bold)
+                    }
+                    TextButton(onClick = { showRestoreMpinGate = false }, enabled = !verifying) {
+                        Text("Cancel")
+                    }
+                }
+            }
+        }
+    }
+
+    overwriteConfirmIds?.let { ids ->
+        val fileIdsOrAll = ids.takeIf { it.isNotEmpty() }
         AlertDialog(
-            onDismissRequest = { overwriteConfirmTargets = null },
+            onDismissRequest = { overwriteConfirmIds = null },
             title = { Text("Overwrite Existing Local Files?") },
             text = { Text("Some selected files already exist on phone storage. Confirm whether to overwrite them or skip existing files.") },
             confirmButton = {
                 Button(onClick = {
-                    viewModel.restoreCloudFiles(targets, overwrite = true)
-                    overwriteConfirmTargets = null
+                    viewModel.restoreFullAccountBackup(
+                        fileIds = fileIdsOrAll,
+                        overwrite = true,
+                        verifiedMpinForKeyRecovery = pendingVerifiedMpin
+                    )
+                    overwriteConfirmIds = null
                 }) { Text("Overwrite") }
             },
             dismissButton = {
                 TextButton(onClick = {
-                    viewModel.restoreCloudFiles(targets, overwrite = false)
-                    overwriteConfirmTargets = null
+                    viewModel.restoreFullAccountBackup(
+                        fileIds = fileIdsOrAll,
+                        overwrite = false,
+                        verifiedMpinForKeyRecovery = pendingVerifiedMpin
+                    )
+                    overwriteConfirmIds = null
                 }) { Text("Skip Existing") }
             }
         )
+    }
+}
+
+@Composable
+private fun CloudMetricTile(
+    label: String,
+    value: String,
+    valueColor: androidx.compose.ui.graphics.Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = VoidBlack.copy(alpha = 0.45f),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, valueColor.copy(alpha = 0.25f)),
+        modifier = modifier
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp)
+        ) {
+            Text(value, style = MaterialTheme.typography.titleMedium, color = valueColor, fontWeight = FontWeight.Bold)
+            Text(label, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = MetallicSilver, maxLines = 1)
+        }
     }
 }
 
@@ -582,8 +1106,8 @@ fun ProfileSettingsScreen(
                 ActionRow(Icons.Filled.DeleteSweep, "Recycle Bin", "Restore or purge deleted files") { onOpenRecycleBin() }
                 ActionRow(
                     Icons.Filled.Storage,
-                    "SQL Database (18 Tables) & Rules",
-                    if (viewModel.isSqlBackendConfigured()) "Firebase ID Token + PostgreSQL Connected" else "Configure BACKEND_API_URL + run schema.sql"
+                    "Neon PostgreSQL & Render Backup",
+                    if (viewModel.isSqlBackendConfigured()) "Render API + Neon PostgreSQL Connected" else (viewModel.cloudBackendConfigurationIssue() ?: "Configure BACKEND_API_URL + DATABASE_URL")
                 ) {
                     showSqlDialog = true
                 }
@@ -974,9 +1498,9 @@ fun ProfileSettingsScreen(
     if (showSqlDialog) {
         Dialog(onDismissRequest = { showSqlDialog = false }) {
             GlassCard4D(contentPadding = PaddingValues(18.dp), modifier = Modifier.heightIn(max = 500.dp)) {
-                Text("Firebase + 18-Table SQL Backend", style = MaterialTheme.typography.titleLarge, color = ElectricBlue)
+                Text("Neon PostgreSQL + Render Backup API", style = MaterialTheme.typography.titleLarge, color = ElectricBlue)
                 Text(
-                    "Set BACKEND_API_URL in AI Studio Secrets, apply database/schema.sql & storage.rules, and deploy backend/.",
+                    "Set BACKEND_API_URL in AI Studio Secrets, configure DATABASE_URL on Render, and deploy backend/.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MetallicSilver
                 )
@@ -1030,9 +1554,9 @@ fun ProfileSettingsScreen(
                 Text(
                     if (kind == "PRIVACY") {
                         "• MPIN is hashed with PBKDF2-HMAC-SHA256 + random salt and never stored in plain text.\n" +
-                            "• Vault files are encrypted on-device using AndroidKeyStore AES-256-GCM before storage or Firebase upload.\n" +
-                            "• SQL Backend verifies Firebase ID tokens on every request and locks access to your single Firebase UID.\n" +
-                            "• Deleting a file from your phone never deletes Firebase Storage backups automatically."
+                            "• Vault files are encrypted on-device with AES-256-GCM before Neon PostgreSQL backup.\n" +
+                            "• Render API verifies Firebase ID tokens on every request and enforces per-user Neon isolation.\n" +
+                            "• Deleting a file from your phone never deletes Neon Cloud Backup copies automatically."
                     } else {
                         "• Upload files via Dashboard or Files tab (supports multi-select & Photo Picker).\n" +
                             "• Open any PDF, DOCX, or Image and tap AI OCR & Details to extract official fields & set expiry reminders.\n" +

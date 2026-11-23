@@ -130,6 +130,31 @@ class SecurePrefs(context: Context) {
         get() = prefs.getBoolean(KEY_CLOUD_OWNER_LOCKED, false)
         set(value) = prefs.edit().putBoolean(KEY_CLOUD_OWNER_LOCKED, value).apply()
 
+    fun getOrCreatePortableVaultKeyBase64(): String {
+        val existing = getDecrypted("enc_portable_vault_key")
+        if (!existing.isNullOrBlank()) return existing
+        val created = CryptoManager.generatePortableAesKeyBase64()
+        putEncrypted("enc_portable_vault_key", created)
+        return created
+    }
+
+    fun getPortableVaultKeyBase64(): String? = getDecrypted("enc_portable_vault_key")
+
+    fun saveRecoveredPortableVaultKeyBase64(keyBase64: String) {
+        putEncrypted("enc_portable_vault_key", keyBase64)
+        prefs.edit().putBoolean("portable_vault_key_wrapped_cloud", true).apply()
+    }
+
+    var isPortableKeyWrappedInCloud: Boolean
+        get() = prefs.getBoolean("portable_vault_key_wrapped_cloud", false)
+        set(value) = prefs.edit().putBoolean("portable_vault_key_wrapped_cloud", value).apply()
+
+    fun setFileKeyVersion(fileId: String, version: Int) {
+        prefs.edit().putInt("vault_kv_$fileId", version).apply()
+    }
+
+    fun getFileKeyVersion(fileId: String): Int = prefs.getInt("vault_kv_$fileId", 0)
+
     fun recordFailedAttempt(): Long {
         val attempts = failedAttempts + 1
         failedAttempts = attempts

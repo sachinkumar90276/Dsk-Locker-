@@ -113,7 +113,7 @@ fun FileViewerScreen(
     LaunchedEffect(fileItem) {
         resolving = true
         resolvedFile = if (fileItem != null) {
-            LocalFileManager.resolveReadableFile(context, fileItem)
+            viewModel.resolveReadableFile(fileItem)
         } else null
         resolving = false
     }
