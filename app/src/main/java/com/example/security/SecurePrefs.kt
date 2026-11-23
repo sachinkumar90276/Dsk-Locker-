@@ -7,6 +7,7 @@ class SecurePrefs(context: Context) {
 
     companion object {
         private const val KEY_OWNER_PHONE = "enc_owner_phone"
+        private const val KEY_OWNER_EMAIL = "enc_owner_email"
         private const val KEY_MPIN_HASH = "enc_mpin_hash"
         private const val KEY_MPIN_SALT = "enc_mpin_salt"
         private const val KEY_MPIN_LENGTH = "mpin_length"
@@ -39,6 +40,10 @@ class SecurePrefs(context: Context) {
     var ownerPhone: String?
         get() = getDecrypted(KEY_OWNER_PHONE)
         set(value) = putEncrypted(KEY_OWNER_PHONE, value)
+
+    var ownerEmail: String?
+        get() = getDecrypted(KEY_OWNER_EMAIL)
+        set(value) = putEncrypted(KEY_OWNER_EMAIL, value)
 
     var firebaseUid: String?
         get() = getDecrypted(KEY_FIREBASE_UID)

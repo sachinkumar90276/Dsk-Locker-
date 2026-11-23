@@ -88,6 +88,9 @@ class DskLockerRepository(
                 if (!currentFbUser.phoneNumber.isNullOrBlank()) {
                     prefs.ownerPhone = currentFbUser.phoneNumber
                 }
+                if (!currentFbUser.email.isNullOrBlank()) {
+                    prefs.ownerEmail = currentFbUser.email
+                }
             }
         }
         if (db.profileSettingsDao().getProfileOnce() == null) {
@@ -174,19 +177,74 @@ class DskLockerRepository(
         return finalizeFirebaseOwnerSession(session)
     }
 
+    suspend fun signInWithGoogle(uiContext: Context): GoogleSignInResult {
+        return when (val authRes = phoneAuth.signInWithGoogle(uiContext)) {
+            is GoogleSignInResult.Success -> {
+                val fin = finalizeFirebaseOwnerSession(authRes.session)
+                if (fin.isSuccess) {
+                    GoogleSignInResult.Success(fin.getOrThrow())
+                } else {
+                    logSecurity(
+                        "GOOGLE_SIGNIN_REJECTED",
+                        fin.exceptionOrNull()?.message ?: "Cloud verification failed",
+                        false
+                    )
+                    GoogleSignInResult.Error(
+                        fin.exceptionOrNull()?.localizedMessage ?: "Cloud verification rejected."
+                    )
+                }
+            }
+            is GoogleSignInResult.Cancelled -> GoogleSignInResult.Cancelled
+            is GoogleSignInResult.Error -> {
+                logSecurity("GOOGLE_SIGNIN_FAILED", authRes.message, false)
+                authRes
+            }
+        }
+    }
+
+    suspend fun attemptSilentGoogleSignIn(): Result<FirebaseSessionUser?> {
+        val session = phoneAuth.attemptSilentGoogleSignIn(context) ?: return Result.success(null)
+        return finalizeFirebaseOwnerSession(session).map { it }
+    }
+
     suspend fun finalizeFirebaseOwnerSession(session: FirebaseSessionUser): Result<FirebaseSessionUser> {
-        val check = validateOwnerPhoneEligibility(session.phoneNumber)
-        if (check.isFailure) {
+        val existingUid = prefs.firebaseUid
+        if (!existingUid.isNullOrBlank() && existingUid != session.uid) {
             phoneAuth.signOut()
-            logSecurity("UNAUTHORIZED_OWNER_BLOCKED", "Rejected ${session.phoneNumber}", false)
-            return Result.failure(check.exceptionOrNull() ?: SecurityException("Unauthorized owner number."))
+            logSecurity("UNAUTHORIZED_OWNER_BLOCKED", "Rejected Firebase UID ${session.uid}", false)
+            return Result.failure(
+                SecurityException("Single-owner lock: DSK LOCKER on this device is linked to another cloud account.")
+            )
+        }
+        val restricted = BackendConfig.restrictedOwnerPhone
+        if (session.phoneNumber.isNotBlank()) {
+            val check = validateOwnerPhoneEligibility(session.phoneNumber)
+            if (check.isFailure) {
+                phoneAuth.signOut()
+                logSecurity("UNAUTHORIZED_OWNER_BLOCKED", "Rejected ${session.phoneNumber}", false)
+                return Result.failure(check.exceptionOrNull() ?: SecurityException("Unauthorized owner number."))
+            }
+        } else if (restricted.isNotBlank()) {
+            phoneAuth.signOut()
+            logSecurity("UNAUTHORIZED_OWNER_BLOCKED", "Rejected account without authorized owner phone $restricted", false)
+            return Result.failure(
+                SecurityException("Access restricted: Only authorized owner $restricted may register or sign in.")
+            )
         }
 
         val existingProfile = db.profileSettingsDao().getProfileOnce() ?: OwnerProfileEntity()
+        val effectivePhone = session.phoneNumber.ifBlank { prefs.ownerPhone.orEmpty() }
+        val effectiveOwnerName = when {
+            existingProfile.ownerName.isNotBlank() && existingProfile.ownerName != "DSK Owner" -> existingProfile.ownerName
+            !session.displayName.isNullOrBlank() -> session.displayName
+            !session.email.isNullOrBlank() -> session.email.substringBefore("@")
+            else -> "DSK Owner"
+        }
+
         val sqlReg = sqlClient.registerOrVerifyOwner(
             firebaseIdToken = session.idToken,
-            phoneE164 = session.phoneNumber,
-            ownerName = existingProfile.ownerName
+            phoneE164 = effectivePhone,
+            ownerName = effectiveOwnerName
         )
         if (sqlReg.isFailure) {
             phoneAuth.signOut()
@@ -195,11 +253,17 @@ class DskLockerRepository(
         }
 
         prefs.firebaseUid = session.uid
-        prefs.ownerPhone = session.phoneNumber
+        if (session.phoneNumber.isNotBlank()) {
+            prefs.ownerPhone = session.phoneNumber
+        }
+        if (!session.email.isNullOrBlank()) {
+            prefs.ownerEmail = session.email
+        }
         prefs.isCloudOwnerVerified = true
 
         val updatedProfile = existingProfile.copy(
-            phoneNumber = session.phoneNumber,
+            ownerName = effectiveOwnerName,
+            phoneNumber = effectivePhone.ifBlank { existingProfile.phoneNumber },
             firebaseUid = session.uid,
             updatedAt = System.currentTimeMillis()
         )
@@ -217,13 +281,14 @@ class DskLockerRepository(
             )
         }
 
-        logSecurity("FIREBASE_OWNER_VERIFIED", "Verified Firebase UID ${session.uid} (${session.phoneNumber})", true)
+        val label = session.phoneNumber.ifBlank { session.email.orEmpty() }
+        logSecurity("FIREBASE_OWNER_VERIFIED", "Verified Firebase UID ${session.uid} ($label)", true)
         return Result.success(session)
     }
 
     suspend fun logoutSession() {
         logSecurity("OWNER_LOGOUT", "Owner logged out from cloud session", true)
-        phoneAuth.signOut()
+        phoneAuth.signOutWithCredentialClear(context)
     }
 
     suspend fun saveNewMpin(mpin: String) {
@@ -842,6 +907,13 @@ class DskLockerRepository(
         }
     }
 
+    suspend fun verifyLiveBackendHealth(): Result<BackendHealthStatusDto> {
+        if (customSqlClient == null && BackendConfig.configurationIssue != null) {
+            return Result.failure(IllegalStateException(BackendConfig.configurationIssue))
+        }
+        return sqlClient.checkBackendHealth()
+    }
+
     suspend fun fetchCloudStatus(): Result<CloudBackupStatusDto> {
         if (customSqlClient == null && BackendConfig.configurationIssue != null) {
             return Result.failure(IllegalStateException(BackendConfig.configurationIssue))
@@ -896,7 +968,7 @@ class DskLockerRepository(
         }
         val token = resolveIdToken()
             ?: return@withContext Result.failure(
-                IllegalStateException("Cloud session unavailable. Sign in with Phone OTP to restore backups.")
+                IllegalStateException("Cloud session unavailable. Sign in with Google to restore backups.")
             )
 
         val startRes = sqlClient.startRestoreJob(

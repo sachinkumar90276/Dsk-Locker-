@@ -10,6 +10,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -161,14 +162,24 @@ data class CloudBackupCreateResultDto(
     val lastBackupAt: Long
 )
 
+data class BackendHealthStatusDto(
+    val reachable: Boolean,
+    val service: String,
+    val status: String,
+    val missingEnv: List<String>,
+    val baseUrl: String,
+    val httpCode: Int = 200
+)
+
 class SqlBackendClient(
     private val baseUrlProvider: () -> String = { BackendConfig.apiBaseUrl }
 ) {
     private val http by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(25, TimeUnit.SECONDS)
-            .readTimeout(90, TimeUnit.SECONDS)
-            .writeTimeout(90, TimeUnit.SECONDS)
+            .connectTimeout(45, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
     }
 
@@ -177,17 +188,90 @@ class SqlBackendClient(
     private fun resolvedBaseUrl(): String = baseUrlProvider().trimEnd('/')
 
     private fun requireConfiguredUrl(): String {
-        val issue = BackendConfig.configurationIssue
         val url = resolvedBaseUrl()
         if (url.isBlank()) {
+            val issue = BackendConfig.configurationIssue
             throw IllegalStateException(
-                issue ?: "Render backend URL missing: configure BACKEND_API_URL in AI Studio Secrets."
+                issue ?: "Render backend URL missing: configure BACKEND_API_URL to ${BackendConfig.LIVE_RENDER_API_URL}."
             )
         }
-        if (url.contains("supabase.", ignoreCase = true)) {
-            throw IllegalStateException("Supabase URLs are disabled. Configure BACKEND_API_URL to Render backend.")
+        if (BackendConfig.isSupabaseUrl(url)) {
+            throw IllegalStateException("Supabase URLs are disabled. Configure BACKEND_API_URL to ${BackendConfig.LIVE_RENDER_API_URL}.")
         }
         return url
+    }
+
+    private fun executeWithColdStartRetry(requestBuilder: () -> Request): okhttp3.Response {
+        var lastException: Exception? = null
+        for (attempt in 0..1) {
+            try {
+                val resp = http.newCall(requestBuilder()).execute()
+                if (attempt == 0 && (resp.code == 502 || resp.code == 503 || resp.code == 504)) {
+                    resp.close()
+                    Thread.sleep(1500L)
+                    continue
+                }
+                return resp
+            } catch (e: java.io.IOException) {
+                lastException = e
+                if (attempt == 0) {
+                    Thread.sleep(1200L)
+                }
+            }
+        }
+        throw IOException(formatNetworkError(lastException), lastException)
+    }
+
+    private fun formatNetworkError(err: Throwable?): String {
+        val msg = err?.message.orEmpty()
+        return when {
+            err is java.net.UnknownHostException ->
+                "Unable to resolve backend host. Check your internet connection."
+            err is java.net.SocketTimeoutException ->
+                "Render backend took too long to respond (waking up from sleep). Please tap Retry in a few seconds."
+            err is java.net.ConnectException ->
+                "Unable to reach DSK LOCKER backend (${resolvedBaseUrl()}). Verify internet connectivity."
+            msg.isNotBlank() ->
+                "Network connection failed: $msg"
+            else ->
+                "Network connection failed while reaching DSK LOCKER backend."
+        }
+    }
+
+    suspend fun checkBackendHealth(): Result<BackendHealthStatusDto> = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = requireConfiguredUrl()
+            executeWithColdStartRetry {
+                Request.Builder().url("$url/").get().build()
+            }.use { rootResp ->
+                if (!rootResp.isSuccessful) {
+                    throw IllegalStateException("Root endpoint check failed (${rootResp.code}).")
+                }
+            }
+            executeWithColdStartRetry {
+                Request.Builder().url("$url/health").get().build()
+            }.use { resp ->
+                val str = resp.body?.string().orEmpty()
+                val json = runCatching { JSONObject(str) }.getOrNull()
+                val missing = mutableListOf<String>()
+                json?.optJSONArray("missingEnv")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        arr.optString(i).takeIf { it.isNotBlank() }?.let { missing.add(it) }
+                    }
+                }
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException(parseError(str, "Health check returned HTTP ${resp.code}."))
+                }
+                BackendHealthStatusDto(
+                    reachable = true,
+                    service = json?.optString("service").orEmpty().ifBlank { "DSK LOCKER Backend" },
+                    status = json?.optString("status").orEmpty().ifBlank { "ok" },
+                    missingEnv = missing,
+                    baseUrl = url,
+                    httpCode = resp.code
+                )
+            }
+        }
     }
 
     suspend fun registerOrVerifyOwner(
@@ -390,7 +474,7 @@ class SqlBackendClient(
                 .addHeader("Content-Type", "application/json")
                 .post(root.toString().toRequestBody(jsonMedia))
                 .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry { req }.use { resp ->
                 val bodyStr = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     throw IllegalStateException(parseError(bodyStr, "Cloud backup upload failed (${resp.code})."))
@@ -416,7 +500,7 @@ class SqlBackendClient(
                 .addHeader("Authorization", "Bearer $firebaseIdToken")
                 .get()
                 .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry { req }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     throw IllegalStateException(parseError(str, "Failed to load backup status (${resp.code})."))
@@ -468,7 +552,7 @@ class SqlBackendClient(
                 .addHeader("Authorization", "Bearer $firebaseIdToken")
                 .get()
                 .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry { req }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     throw IllegalStateException(parseError(str, "Failed to load backup history (${resp.code})."))
@@ -511,7 +595,7 @@ class SqlBackendClient(
                 .addHeader("Authorization", "Bearer $firebaseIdToken")
                 .get()
                 .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry { req }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     throw IllegalStateException(parseError(str, "Failed to load cloud backup files (${resp.code})."))

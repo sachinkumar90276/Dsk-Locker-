@@ -116,9 +116,9 @@ dependencies {
   // Firebase Authentication (Phone OTP) & Firebase Storage
   implementation(libs.firebase.auth)
   implementation(libs.firebase.storage)
-  // implementation(libs.androidx.credentials)
-  // implementation(libs.androidx.credentials.play.services)
-  // implementation(libs.googleid)
+  implementation(libs.androidx.credentials)
+  implementation(libs.androidx.credentials.play.services)
+  implementation(libs.googleid)
   implementation(libs.firebase.appcheck.recaptcha)
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.androidx.biometric)

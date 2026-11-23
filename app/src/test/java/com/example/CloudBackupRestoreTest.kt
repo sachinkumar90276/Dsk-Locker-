@@ -9,6 +9,7 @@ import com.example.data.DskLockerRepository
 import com.example.data.local.*
 import com.example.data.remote.BackendConfig
 import com.example.data.remote.CloudBackupSettingsDto
+import com.example.data.remote.FirebaseSessionUser
 import com.example.data.remote.SqlBackendClient
 import com.example.security.CryptoManager
 import com.sun.net.httpserver.HttpExchange
@@ -49,6 +50,67 @@ class CloudBackupRestoreTest {
     @After
     fun tearDown() {
         server.stop()
+    }
+
+    @Test
+    fun `production BackendConfig points to live Render URL and rejects supabase and localhost URLs`() {
+        assertEquals("https://dsk-locker-k5jn.onrender.com", BackendConfig.apiBaseUrl)
+        assertTrue(BackendConfig.isSqlBackendConfigured)
+        assertTrue(BackendConfig.isLocalhostUrl("http://localhost:8080"))
+        assertTrue(BackendConfig.isLocalhostUrl("http://127.0.0.1:8080"))
+        assertTrue(BackendConfig.isLocalhostUrl("http://10.0.2.2:8080"))
+        assertFalse(BackendConfig.isLocalhostUrl("https://dsk-locker-k5jn.onrender.com"))
+    }
+
+    @Test
+    fun `health check verifies root and health endpoints and recovers from single cold-start 503`() = runBlocking {
+        server.failNextHealthWith503 = true
+        val client = SqlBackendClient { baseUrl }
+        val healthRes = client.checkBackendHealth()
+        assertTrue(healthRes.isSuccess)
+        val health = healthRes.getOrThrow()
+        assertTrue(health.reachable)
+        assertEquals("ok", health.status)
+        assertEquals(200, health.httpCode)
+    }
+
+    @Test
+    fun `Google Sign-In session finalizes cleanly without phone number and enforces single-owner UID lock`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        repo.saveNewMpin("482910")
+
+        val googleSession = FirebaseSessionUser(
+            uid = "uid-user-a",
+            phoneNumber = "",
+            idToken = "token-user-a",
+            email = "owner@gmail.com",
+            displayName = "Sachin Owner"
+        )
+        val firstRes = repo.finalizeFirebaseOwnerSession(googleSession)
+        assertTrue(firstRes.isSuccess)
+        assertEquals("uid-user-a", repo.prefs.firebaseUid)
+        assertEquals("owner@gmail.com", repo.prefs.ownerEmail)
+        assertTrue(repo.prefs.isCloudOwnerVerified)
+
+        val profile = DskLockerDatabase.getInstance(context).profileSettingsDao().getProfileOnce()
+        assertEquals("Sachin Owner", profile?.ownerName)
+        assertEquals("uid-user-a", profile?.firebaseUid)
+
+        // Different Firebase UID must be blocked by single-owner device lock
+        val otherAccount = FirebaseSessionUser(
+            uid = "uid-user-b",
+            phoneNumber = "",
+            idToken = "token-user-b",
+            email = "intruder@gmail.com",
+            displayName = "Other User"
+        )
+        val blockedRes = repo.finalizeFirebaseOwnerSession(otherAccount)
+        assertTrue(blockedRes.isFailure)
+        assertTrue(blockedRes.exceptionOrNull() is SecurityException)
     }
 
     @Test
@@ -363,6 +425,7 @@ class CloudBackupRestoreTest {
         @Volatile var forceNextCreateErrorCode: Int? = null
         @Volatile var forceNextCreateErrorMessage: String? = null
         @Volatile var corruptDownloadForFileId: String? = null
+        @Volatile var failNextHealthWith503: Boolean = false
 
         data class StoredFile(
             val fileId: String,
@@ -392,7 +455,7 @@ class CloudBackupRestoreTest {
 
         fun start(): String {
             val s = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-            s.createContext("/api/") { ex ->
+            s.createContext("/") { ex ->
                 try {
                     handle(ex)
                 } catch (t: Throwable) {
@@ -438,6 +501,23 @@ class CloudBackupRestoreTest {
         }
 
         private fun handle(ex: HttpExchange) {
+            val path = ex.requestURI.path
+            val method = ex.requestMethod
+
+            if (method == "GET" && path == "/") {
+                sendJson(ex, 200, JSONObject().put("service", "DSK LOCKER Test Backend").put("status", "ok"))
+                return
+            }
+            if (method == "GET" && path == "/health") {
+                if (failNextHealthWith503) {
+                    failNextHealthWith503 = false
+                    sendJson(ex, 503, JSONObject().put("status", "waking_up"))
+                    return
+                }
+                sendJson(ex, 200, JSONObject().put("service", "DSK LOCKER Test Backend").put("status", "ok").put("missingEnv", JSONArray()))
+                return
+            }
+
             val authHeader = ex.requestHeaders.getFirst("Authorization").orEmpty()
             val token = authHeader.removePrefix("Bearer ").trim()
             val uid = when (token) {
@@ -449,11 +529,17 @@ class CloudBackupRestoreTest {
                 }
             }
 
-            val path = ex.requestURI.path
-            val method = ex.requestMethod
             val bodyText = ex.requestBody.bufferedReader().readText()
 
             when {
+                method == "POST" && path == "/api/auth/register-owner" -> {
+                    sendJson(ex, 200, JSONObject().put("ok", true).put("firebaseUid", uid))
+                }
+
+                method == "POST" && path.startsWith("/api/sync/") -> {
+                    sendJson(ex, 200, JSONObject().put("ok", true))
+                }
+
                 method == "PUT" && path == "/api/security/mpin" -> {
                     val j = JSONObject(bodyText)
                     val st = securityByUser.getOrPut(uid) { SecurityState() }

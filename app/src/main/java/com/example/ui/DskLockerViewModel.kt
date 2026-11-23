@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.app.Activity
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -10,10 +11,12 @@ import com.example.ai.ExtendedOcrMetadata
 import com.example.data.DskLockerRepository
 import com.example.data.local.*
 import com.example.data.remote.BackendConfig
+import com.example.data.remote.BackendHealthStatusDto
 import com.example.data.remote.CloudBackupFilesResponseDto
 import com.example.data.remote.CloudBackupHistoryResponseDto
 import com.example.data.remote.CloudBackupStatusDto
 import com.example.data.remote.FetchedLinkMetadata
+import com.example.data.remote.GoogleSignInResult
 import com.example.data.remote.PhoneOtpStartResult
 import com.example.security.BiometricAvailability
 import com.example.security.BiometricHelper
@@ -140,11 +143,20 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     private val _cloudHistory = MutableStateFlow<CloudBackupHistoryResponseDto?>(null)
     val cloudHistory: StateFlow<CloudBackupHistoryResponseDto?> = _cloudHistory.asStateFlow()
 
+    private val _backendHealth = MutableStateFlow<BackendHealthStatusDto?>(null)
+    val backendHealth: StateFlow<BackendHealthStatusDto?> = _backendHealth.asStateFlow()
+
+    private val _backendHealthError = MutableStateFlow<String?>(null)
+    val backendHealthError: StateFlow<String?> = _backendHealthError.asStateFlow()
+
     private val _cloudAuthLoading = MutableStateFlow(false)
     val cloudAuthLoading: StateFlow<Boolean> = _cloudAuthLoading.asStateFlow()
 
     private val _cloudAuthError = MutableStateFlow<String?>(null)
     val cloudAuthError: StateFlow<String?> = _cloudAuthError.asStateFlow()
+
+    private val _cloudSessionActive = MutableStateFlow(repo.hasFirebaseSession())
+    val cloudSessionActive: StateFlow<Boolean> = _cloudSessionActive.asStateFlow()
 
     private val _otpPendingPhone = MutableStateFlow<String?>(null)
     val otpPendingPhone: StateFlow<String?> = _otpPendingPhone.asStateFlow()
@@ -180,6 +192,14 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                 .getOrDefault(DeviceStorageStats(0L, 0L, 0L))
             runCatching { startLockoutCountdownIfNeeded() }
             runCatching { repo.recoverInterruptedBackups() }
+            if (BackendConfig.isSqlBackendConfigured) {
+                repo.verifyLiveBackendHealth()
+                    .onSuccess {
+                        _backendHealth.value = it
+                        _backendHealthError.value = null
+                    }
+                    .onFailure { _backendHealthError.value = it.localizedMessage }
+            }
         }
         runCatching {
             val monitor = ConnectivityBackupMonitor(
@@ -242,7 +262,11 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun firebaseUidDisplay(): String = repo.currentFirebaseUid() ?: "Local MPIN Vault"
 
-    fun ownerPhoneDisplay(): String = repo.prefs.ownerPhone?.takeIf { it.isNotBlank() } ?: "MPIN Protected Owner"
+    fun ownerPhoneDisplay(): String =
+        repo.prefs.ownerPhone?.takeIf { it.isNotBlank() }
+            ?: repo.prefs.ownerEmail?.takeIf { it.isNotBlank() }
+            ?: repo.phoneAuth.currentUser()?.email?.takeIf { it.isNotBlank() }
+            ?: "MPIN Protected Owner"
 
     fun lastBackupMs(): Long = _cloudBackupStatus.value?.lastBackupAt ?: repo.prefs.lastBackupMs
 
@@ -867,7 +891,59 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    // --- Neon Cloud Backup & Restore + Phone OTP Recovery Login ---
+    // --- Neon Cloud Backup & Restore + Google Sign-In / Optional Phone OTP ---
+    fun signInCloudWithGoogle(uiContext: Context) {
+        if (_cloudAuthLoading.value) return
+        _cloudAuthError.value = null
+        _cloudAuthLoading.value = true
+        viewModelScope.launch {
+            val result = repo.signInWithGoogle(uiContext)
+            _cloudAuthLoading.value = false
+            _cloudSessionActive.value = repo.hasFirebaseSession()
+            when (result) {
+                is GoogleSignInResult.Success -> {
+                    _otpVerificationId.value = null
+                    _otpPendingPhone.value = null
+                    val accountLabel = result.session.email?.takeIf { it.isNotBlank() }
+                        ?: result.session.phoneNumber.ifBlank { result.session.uid }
+                    _statusBanner.value = "Cloud account linked ($accountLabel)."
+                    refreshCloudBackupDashboard()
+                }
+                is GoogleSignInResult.Cancelled -> {
+                    _cloudAuthError.value = null
+                }
+                is GoogleSignInResult.Error -> {
+                    _cloudAuthError.value = result.message
+                }
+            }
+        }
+    }
+
+    fun attemptSilentCloudSignIn() {
+        if (repo.hasFirebaseSession()) {
+            _cloudSessionActive.value = true
+            return
+        }
+        viewModelScope.launch {
+            val res = repo.attemptSilentGoogleSignIn()
+            _cloudSessionActive.value = repo.hasFirebaseSession()
+            if (res.getOrNull() != null) {
+                refreshCloudBackupDashboard()
+            }
+        }
+    }
+
+    fun signOutCloudAccount() {
+        viewModelScope.launch {
+            repo.logoutSession()
+            _cloudSessionActive.value = repo.hasFirebaseSession()
+            _cloudBackupStatus.value = null
+            _cloudRestorePreview.value = null
+            _cloudHistory.value = null
+            _statusBanner.value = "Signed out of cloud backup session."
+        }
+    }
+
     fun sendCloudOtp(activity: Activity, rawPhoneInput: String, isResend: Boolean = false) {
         val cleaned = rawPhoneInput.trim().replace(" ", "").let {
             when {
@@ -903,6 +979,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                         val fin = repo.finalizeFirebaseOwnerSession(session)
                         _cloudAuthLoading.value = false
+                        _cloudSessionActive.value = repo.hasFirebaseSession()
                         if (fin.isSuccess) {
                             _otpVerificationId.value = null
                             _otpPendingPhone.value = null
@@ -937,6 +1014,7 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             val res = repo.verifyFirebaseOtp(verId, otpCode.trim(), phone)
             _cloudAuthLoading.value = false
+            _cloudSessionActive.value = repo.hasFirebaseSession()
             if (res.isSuccess) {
                 _otpVerificationId.value = null
                 _otpPendingPhone.value = null
@@ -955,9 +1033,36 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         _cloudAuthLoading.value = false
     }
 
+    fun checkLiveBackendHealth(showBanner: Boolean = false) {
+        viewModelScope.launch {
+            repo.verifyLiveBackendHealth()
+                .onSuccess { health ->
+                    _backendHealth.value = health
+                    _backendHealthError.value = null
+                    if (showBanner) {
+                        _statusBanner.value = "Render Backend Online (${health.baseUrl}): status=${health.status}"
+                    }
+                }
+                .onFailure { err ->
+                    val msg = err.localizedMessage ?: "Unable to reach DSK LOCKER backend."
+                    _backendHealthError.value = msg
+                    if (showBanner) {
+                        _statusBanner.value = msg
+                    }
+                }
+        }
+    }
+
     fun refreshCloudBackupDashboard() {
         viewModelScope.launch {
-            if (!BackendConfig.isSqlBackendConfigured || !repo.hasFirebaseSession()) return@launch
+            if (!BackendConfig.isSqlBackendConfigured) return@launch
+            repo.verifyLiveBackendHealth()
+                .onSuccess {
+                    _backendHealth.value = it
+                    _backendHealthError.value = null
+                }
+                .onFailure { _backendHealthError.value = it.localizedMessage }
+            if (!repo.hasFirebaseSession()) return@launch
             repo.fetchCloudStatus().onSuccess { _cloudBackupStatus.value = it }
             repo.fetchCloudFilesSnapshot().onSuccess { _cloudRestorePreview.value = it }
             repo.fetchCloudHistory().onSuccess { _cloudHistory.value = it }

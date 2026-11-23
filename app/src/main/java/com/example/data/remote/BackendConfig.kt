@@ -3,8 +3,10 @@ package com.example.data.remote
 import com.example.BuildConfig
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
+import java.net.URI
 
 object BackendConfig {
+    const val LIVE_RENDER_API_URL = "https://dsk-locker-k5jn.onrender.com"
     private const val PLACEHOLDER_URL = "https://your-dsk-backend.example.com"
     private const val PLACEHOLDER_RENDER_URL = "https://your-dsk-locker-backend.onrender.com"
     private const val PLACEHOLDER_PHONE = "OPTIONAL_OWNER_PHONE"
@@ -13,27 +15,52 @@ object BackendConfig {
         get() = readField("BACKEND_API_URL").trimEnd('/')
 
     val isSupabaseUrlBlocked: Boolean
-        get() = rawConfiguredApiUrl.contains("supabase.", ignoreCase = true)
+        get() = isSupabaseUrl(rawConfiguredApiUrl)
+
+    val isLocalhostUrlBlocked: Boolean
+        get() = isLocalhostUrl(rawConfiguredApiUrl)
 
     val apiBaseUrl: String
-        get() = rawConfiguredApiUrl
-            .takeIf {
-                it.isNotBlank() &&
-                    it != PLACEHOLDER_URL &&
-                    it != PLACEHOLDER_RENDER_URL &&
-                    it.startsWith("http") &&
-                    !it.contains("supabase.", ignoreCase = true)
+        get() {
+            val configured = rawConfiguredApiUrl
+            if (isSupabaseUrl(configured) || isLocalhostUrl(configured)) {
+                return ""
             }
-            .orEmpty()
+            if (configured.isBlank() || configured == PLACEHOLDER_URL || configured == PLACEHOLDER_RENDER_URL) {
+                return LIVE_RENDER_API_URL
+            }
+            return if (configured.startsWith("https://") || configured.startsWith("http://")) {
+                configured
+            } else {
+                ""
+            }
+        }
 
     val configurationIssue: String?
         get() = when {
             isSupabaseUrlBlocked ->
-                "BACKEND_API_URL points to Supabase, which is disabled. Update BACKEND_API_URL in AI Studio Secrets to your Render backend URL."
+                "BACKEND_API_URL points to Supabase, which is disabled. Use $LIVE_RENDER_API_URL."
+            isLocalhostUrlBlocked ->
+                "Localhost backend URL is not allowed in production builds. Use $LIVE_RENDER_API_URL."
             apiBaseUrl.isBlank() ->
-                "Render backend URL missing: configure BACKEND_API_URL in AI Studio Secrets."
+                "Invalid BACKEND_API_URL configuration. Use $LIVE_RENDER_API_URL."
             else -> null
         }
+
+    fun isSupabaseUrl(url: String): Boolean =
+        url.contains("supabase.", ignoreCase = true)
+
+    fun isLocalhostUrl(url: String): Boolean {
+        if (url.isBlank()) return false
+        val host = runCatching { URI(url).host?.lowercase() }.getOrNull().orEmpty()
+        return host == "localhost" ||
+            host == "127.0.0.1" ||
+            host == "0.0.0.0" ||
+            host == "10.0.2.2" ||
+            url.contains("://localhost", ignoreCase = true) ||
+            url.contains("://127.0.0.1", ignoreCase = true) ||
+            url.contains("://10.0.2.2", ignoreCase = true)
+    }
 
     val restrictedOwnerPhone: String
         get() = readField("AUTHORIZED_OWNER_PHONE")

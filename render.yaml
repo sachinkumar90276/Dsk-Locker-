@@ -26,7 +26,7 @@ services:
       - key: VAULT_MASTER_SECRET
         sync: false
       - key: CORS_ALLOWED_ORIGINS
-        sync: false
+        value: https://ais-dev-yl6uo4q5ujloyxufbx373q-18659658758.asia-northeast1.run.app,https://ais-pre-yl6uo4q5ujloyxufbx373q-18659658758.asia-northeast1.run.app,https://dsk-locker-k5jn.onrender.com
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: AUTHORIZED_OWNER_PHONE

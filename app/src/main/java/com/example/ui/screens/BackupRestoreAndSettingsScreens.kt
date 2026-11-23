@@ -16,6 +16,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.Notes
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -80,6 +83,8 @@ fun BackupRestoreScreen(
     val cloudStatus by viewModel.cloudBackupStatus.collectAsState()
     val cloudRestorePreview by viewModel.cloudRestorePreview.collectAsState()
     val cloudHistory by viewModel.cloudHistory.collectAsState()
+    val backendHealth by viewModel.backendHealth.collectAsState()
+    val backendHealthError by viewModel.backendHealthError.collectAsState()
     val cloudAuthLoading by viewModel.cloudAuthLoading.collectAsState()
     val cloudAuthError by viewModel.cloudAuthError.collectAsState()
     val otpVerificationId by viewModel.otpVerificationId.collectAsState()
@@ -88,7 +93,11 @@ fun BackupRestoreScreen(
 
     val settings = settingsState ?: UserSettingsEntity()
     val configIssue = viewModel.cloudBackendConfigurationIssue()
-    val hasCloudSession = viewModel.isFirebaseSessionActive()
+    val hasCloudSession by viewModel.cloudSessionActive.collectAsState()
+
+    LaunchedEffect(Unit) {
+        viewModel.attemptSilentCloudSignIn()
+    }
 
     LaunchedEffect(hasCloudSession) {
         viewModel.refreshCloudBackupDashboard()
@@ -246,12 +255,28 @@ fun BackupRestoreScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text("NEON POSTGRESQL VAULT SYNC", style = MaterialTheme.typography.labelLarge, color = ElectricBlue)
                         Text(
                             if (lastBackupTs > 0L) "Last backup: ${fmt.format(Date(lastBackupTs))}" else "Last backup: Never",
                             style = MaterialTheme.typography.labelSmall,
                             color = MetallicSilver
+                        )
+                        val liveHealthText = when {
+                            backendHealth?.reachable == true ->
+                                "Render API: Online (${backendHealth!!.status}) • ${backendHealth!!.baseUrl}"
+                            !backendHealthError.isNullOrBlank() ->
+                                "Render API: $backendHealthError"
+                            else ->
+                                "Render API: ${com.example.data.remote.BackendConfig.apiBaseUrl}"
+                        }
+                        Text(
+                            text = liveHealthText,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = if (backendHealth?.reachable == true) EmeraldSync else AmberPending,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.clickable { viewModel.checkLiveBackendHealth(showBanner = true) }
                         )
                     }
                     Surface(
@@ -506,7 +531,7 @@ fun BackupRestoreScreen(
                             subtitle = if (hasCloudSession) {
                                 "Tap Backup Now in the Backup tab to back up your files & OCR metadata to Neon PostgreSQL."
                             } else {
-                                "Tap Cloud Login above using your Phone OTP to fetch your Neon backups after reinstalling."
+                                "Tap Cloud Login above and Sign in with Google to fetch your Neon backups after reinstalling."
                             },
                             icon = Icons.Filled.CloudOff,
                             glowColor = ElectricBlue
@@ -640,75 +665,136 @@ fun BackupRestoreScreen(
     if (showCloudOtpDialog) {
         var phoneInput by remember { mutableStateOf(otpPendingPhone ?: viewModel.ownerPhoneDisplay().takeIf { it.startsWith("+") } ?: "+91") }
         var otpCode by remember { mutableStateOf("") }
+        var showPhoneOtpAdvanced by remember { mutableStateOf(otpVerificationId != null) }
         Dialog(onDismissRequest = {
             viewModel.cancelCloudOtp()
             showCloudOtpDialog = false
         }) {
             GlassCard4D(glowColor = ElectricBlue, contentPadding = PaddingValues(20.dp)) {
-                Text("CLOUD ACCOUNT RECOVERY LOGIN", style = MaterialTheme.typography.titleLarge, color = SilverWhite)
+                Text("CLOUD ACCOUNT LOGIN", style = MaterialTheme.typography.titleLarge, color = SilverWhite)
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    if (otpVerificationId == null) {
-                        "Verify your owner phone number via Firebase OTP to link this device with your Neon Cloud Backup."
+                    if (hasCloudSession) {
+                        "Linked to ${viewModel.ownerPhoneDisplay()}. Encrypted backups and restore are active on Neon PostgreSQL."
                     } else {
-                        "Enter the 6-digit OTP sent to ${otpPendingPhone.orEmpty()}"
+                        "Sign in with your Google account to link DSK LOCKER with your Render + Neon Cloud Backup."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MetallicSilver
                 )
-                Spacer(modifier = Modifier.height(12.dp))
-                if (otpVerificationId == null) {
-                    OutlinedTextField(
-                        value = phoneInput,
-                        onValueChange = { phoneInput = it },
-                        label = { Text("Phone (+91...)") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                Spacer(modifier = Modifier.height(14.dp))
+                if (hasCloudSession) {
+                    OutlinedButton(
+                        enabled = !cloudAuthLoading,
+                        onClick = {
+                            viewModel.signOutCloudAccount()
+                            showCloudOtpDialog = false
+                        },
+                        border = BorderStroke(1.dp, CrimsonAlert.copy(alpha = 0.7f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("cloud_sign_out_button")
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = CrimsonAlert, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Sign Out Cloud Session", color = CrimsonAlert, fontWeight = FontWeight.Bold)
+                    }
                 } else {
-                    OutlinedTextField(
-                        value = otpCode,
-                        onValueChange = { if (it.length <= 6) otpCode = it.filter { ch -> ch.isDigit() } },
-                        label = { Text("6-Digit OTP") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    Button(
+                        enabled = !cloudAuthLoading,
+                        onClick = { viewModel.signInCloudWithGoogle(activity ?: context) },
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("google_sign_in_button")
+                    ) {
+                        if (cloudAuthLoading && !showPhoneOtpAdvanced) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = VoidBlack
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Connecting Google...", fontWeight = FontWeight.Bold)
+                        } else {
+                            Icon(Icons.Filled.AccountCircle, contentDescription = null, modifier = Modifier.size(20.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Sign in with Google", fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(
+                        onClick = { showPhoneOtpAdvanced = !showPhoneOtpAdvanced },
+                        modifier = Modifier.align(Alignment.Start)
+                    ) {
+                        Text(
+                            if (showPhoneOtpAdvanced) "Hide Phone OTP Option" else "Advanced: Phone OTP (Custom Project)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MetallicSilver
+                        )
+                    }
+
+                    if (showPhoneOtpAdvanced) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        if (otpVerificationId == null) {
+                            OutlinedTextField(
+                                value = phoneInput,
+                                onValueChange = { phoneInput = it },
+                                label = { Text("Phone (+91...)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        } else {
+                            OutlinedTextField(
+                                value = otpCode,
+                                onValueChange = { if (it.length <= 6) otpCode = it.filter { ch -> ch.isDigit() } },
+                                label = { Text("6-Digit OTP") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
                 }
+
                 if (cloudAuthError != null) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(cloudAuthError!!, style = MaterialTheme.typography.labelMedium, color = CrimsonAlert)
                 }
-                Spacer(modifier = Modifier.height(14.dp))
+
+                Spacer(modifier = Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
                     TextButton(onClick = {
                         viewModel.cancelCloudOtp()
                         showCloudOtpDialog = false
                     }) { Text("Close") }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    if (otpVerificationId == null) {
-                        Button(
-                            enabled = !cloudAuthLoading && activity != null,
-                            onClick = { activity?.let { viewModel.sendCloudOtp(it, phoneInput) } }
-                        ) {
-                            if (cloudAuthLoading) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            } else {
-                                Text("Send OTP")
+                    if (!hasCloudSession && showPhoneOtpAdvanced) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        if (otpVerificationId == null) {
+                            OutlinedButton(
+                                enabled = !cloudAuthLoading && activity != null,
+                                onClick = { activity?.let { viewModel.sendCloudOtp(it, phoneInput) } }
+                            ) {
+                                if (cloudAuthLoading) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Text("Send OTP")
+                                }
                             }
-                        }
-                    } else {
-                        Button(
-                            enabled = !cloudAuthLoading && otpCode.length == 6,
-                            onClick = {
-                                viewModel.verifyCloudOtp(otpCode)
-                            }
-                        ) {
-                            if (cloudAuthLoading) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            } else {
-                                Text("Verify & Link")
+                        } else {
+                            Button(
+                                enabled = !cloudAuthLoading && otpCode.length == 6,
+                                onClick = { viewModel.verifyCloudOtp(otpCode) }
+                            ) {
+                                if (cloudAuthLoading) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Text("Verify & Link")
+                                }
                             }
                         }
                     }
@@ -1101,7 +1187,7 @@ fun ProfileSettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 ActionRow(Icons.Filled.Backup, "Backup & Restore Center", "Auto backup, history & restore") { onOpenBackupRestore() }
-                ActionRow(Icons.Filled.Notes, "Text Notes Manager", "Create & search private notes") { onOpenNotes() }
+                ActionRow(Icons.AutoMirrored.Filled.Notes, "Text Notes Manager", "Create & search private notes") { onOpenNotes() }
                 ActionRow(Icons.Filled.VideoLibrary, "Video & Website Links", "Saved YouTube & web bookmarks") { onOpenLinks("VIDEO_URL") }
                 ActionRow(Icons.Filled.DeleteSweep, "Recycle Bin", "Restore or purge deleted files") { onOpenRecycleBin() }
                 ActionRow(
@@ -1138,7 +1224,7 @@ fun ProfileSettingsScreen(
                 ActionRow(Icons.Filled.PrivacyTip, "Privacy & Zero-Trust Policy", "Single-owner RLS & AndroidKeyStore AES-256") {
                     showHelpPrivacyDialog = "PRIVACY"
                 }
-                ActionRow(Icons.Filled.HelpOutline, "Help & Quick Guide", "MPIN lock, Camera + ML Kit scanner, AI OCR & backup") {
+                ActionRow(Icons.AutoMirrored.Filled.HelpOutline, "Help & Quick Guide", "MPIN lock, Camera + ML Kit scanner, AI OCR & backup") {
                     showHelpPrivacyDialog = "HELP"
                 }
                 HorizontalDivider(color = NeonViolet.copy(alpha = 0.25f), modifier = Modifier.padding(vertical = 10.dp))
@@ -1500,7 +1586,7 @@ fun ProfileSettingsScreen(
             GlassCard4D(contentPadding = PaddingValues(18.dp), modifier = Modifier.heightIn(max = 500.dp)) {
                 Text("Neon PostgreSQL + Render Backup API", style = MaterialTheme.typography.titleLarge, color = ElectricBlue)
                 Text(
-                    "Set BACKEND_API_URL in AI Studio Secrets, configure DATABASE_URL on Render, and deploy backend/.",
+                    "Live Render API: ${com.example.data.remote.BackendConfig.apiBaseUrl} • PostgreSQL storage is verified server-side via DATABASE_URL.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MetallicSilver
                 )
