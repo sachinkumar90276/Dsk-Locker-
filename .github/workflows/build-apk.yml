@@ -176,16 +176,17 @@ jobs:
               print("Using existing app/google-services.json from repository.")
           else:
               print(
-                  "ERROR: app/google-services.json is unavailable for Android package 'com.aistudio.dsklocker.vxqtzm'.\n"
+                  "WARNING: app/google-services.json is not configured for Android package 'com.aistudio.dsklocker.vxqtzm'.\n"
                   "Checked in order:\n"
                   "  1. GitHub Secret GOOGLE_SERVICES_JSON -> not configured\n"
                   "  2. GitHub Secret GOOGLE_SERVICES_JSON_BASE64 -> not configured\n"
                   "  3. Committed app/google-services.json -> missing or empty\n"
-                  "Fix: Include app/google-services.json in your repository OR set GitHub Secret GOOGLE_SERVICES_JSON / GOOGLE_SERVICES_JSON_BASE64.\n"
-                  "APK compilation is halted because Firebase Auth (Google Sign-In, Email/Password, Phone OTP), App Check, and Cloud Backup require R.string.default_web_client_id and FirebaseApp config.",
+                  "Continuing build in local/offline APK mode without Firebase credentials.\n"
+                  "To enable Firebase Auth (Google Sign-In, Email/Password, Phone OTP), App Check, and Cloud Backup, "
+                  "add GitHub Secret GOOGLE_SERVICES_JSON / GOOGLE_SERVICES_JSON_BASE64 or commit app/google-services.json.",
                   file=sys.stderr,
               )
-              sys.exit(1)
+              sys.exit(0)
 
           try:
               data = json.loads(target.read_text(encoding="utf-8").lstrip("\ufeff"))
