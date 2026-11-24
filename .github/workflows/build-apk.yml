@@ -81,12 +81,20 @@ jobs:
 
           echo "Using preinstalled Android SDK at: $SDK_DIR"
           "$SDKMANAGER" --version
-          { yes || true; } | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses > /dev/null
-          "$SDKMANAGER" --sdk_root="$SDK_DIR" --install \
-            "platform-tools" \
-            "platforms;android-36.1" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
+          if [ ! -d "$SDK_DIR/platforms/android-36.1" ] || [ ! -d "$SDK_DIR/platforms/android-36" ] || [ ! -d "$SDK_DIR/build-tools/36.0.0" ] || [ ! -d "$SDK_DIR/platform-tools" ]; then
+            if [ -w "$SDK_DIR" ]; then
+              { yes || true; } | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses > /dev/null
+              "$SDKMANAGER" --sdk_root="$SDK_DIR" --install \
+                "platform-tools" \
+                "platforms;android-36.1" \
+                "platforms;android-36" \
+                "build-tools;36.0.0"
+            else
+              echo "WARNING: $SDK_DIR is not writable; using preinstalled SDK packages only."
+            fi
+          else
+            echo "Required Android SDK platforms and build-tools are already installed."
+          fi
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
@@ -150,7 +158,7 @@ jobs:
           import sys
 
           target = pathlib.Path("app/google-services.json")
-          raw = os.environ.get("GOOGLE_SERVICES_JSON_RAW", "").strip()
+          raw = os.environ.get("GOOGLE_SERVICES_JSON_RAW", "").lstrip("\ufeff").strip()
           b64 = os.environ.get("GOOGLE_SERVICES_JSON_B64", "").strip()
 
           if raw:
@@ -165,18 +173,22 @@ jobs:
               target.write_bytes(decoded)
               print("Populated app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret.")
           elif target.is_file() and target.stat().st_size > 0:
-              print("Using committed app/google-services.json from repository.")
+              print("Using existing app/google-services.json from repository.")
           else:
               print(
-                  "ERROR: app/google-services.json is missing.\n"
-                  "Add GitHub Repository Secret GOOGLE_SERVICES_JSON or GOOGLE_SERVICES_JSON_BASE64 "
-                  "(using your Firebase Android app google-services.json).",
+                  "ERROR: app/google-services.json is unavailable for Android package 'com.aistudio.dsklocker.vxqtzm'.\n"
+                  "Checked in order:\n"
+                  "  1. GitHub Secret GOOGLE_SERVICES_JSON -> not configured\n"
+                  "  2. GitHub Secret GOOGLE_SERVICES_JSON_BASE64 -> not configured\n"
+                  "  3. Committed app/google-services.json -> missing or empty\n"
+                  "Fix: Include app/google-services.json in your repository OR set GitHub Secret GOOGLE_SERVICES_JSON / GOOGLE_SERVICES_JSON_BASE64.\n"
+                  "APK compilation is halted because Firebase Auth (Google Sign-In, Email/Password, Phone OTP), App Check, and Cloud Backup require R.string.default_web_client_id and FirebaseApp config.",
                   file=sys.stderr,
               )
               sys.exit(1)
 
           try:
-              data = json.loads(target.read_text(encoding="utf-8"))
+              data = json.loads(target.read_text(encoding="utf-8").lstrip("\ufeff"))
           except Exception as exc:
               print(f"ERROR: app/google-services.json is not valid JSON: {exc}", file=sys.stderr)
               sys.exit(1)
@@ -266,9 +278,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
+          if [ -x ./gradlew ]; then
             ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+          elif [ -f ./gradlew ]; then
+            bash ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
           else
             gradle :app:testDebugUnitTest --no-daemon --stacktrace
           fi
@@ -277,9 +290,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
+          if [ -x ./gradlew ]; then
             ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          elif [ -f ./gradlew ]; then
+            bash ./gradlew :app:assembleDebug --no-daemon --stacktrace
           else
             gradle :app:assembleDebug --no-daemon --stacktrace
           fi
