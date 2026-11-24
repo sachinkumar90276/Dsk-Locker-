@@ -287,6 +287,14 @@ jobs:
             gradle :app:testDebugUnitTest --no-daemon --stacktrace
           fi
 
+      - name: Upload Unit Test Reports on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSK-Locker-UnitTest-Reports
+          path: app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
+
       - name: Build Android Debug APK
         shell: bash
         run: |

@@ -127,64 +127,84 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `DskLockerViewModel instantiates cleanly via AndroidViewModelFactory`() {
+    fun `DskLockerViewModel instantiates cleanly via AndroidViewModelFactory`() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         com.google.firebase.FirebaseApp.initializeApp(app)
         com.example.security.configureAppCheck(app, null)
-        val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(app)
-        val vm = androidx.lifecycle.ViewModelProvider(
-            androidx.lifecycle.ViewModelStore(),
-            factory
-        )[com.example.ui.DskLockerViewModel::class.java]
-        assertNotNull(vm)
-        assertEquals(com.example.ui.AuthStage.CREATE_MPIN, vm.authStage.value)
+        val store = androidx.lifecycle.ViewModelStore()
+        val storeWithPin = androidx.lifecycle.ViewModelStore()
+        try {
+            val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory(app)
+            val vm = androidx.lifecycle.ViewModelProvider(
+                store,
+                factory
+            )[com.example.ui.DskLockerViewModel::class.java]
+            assertNotNull(vm)
+            assertEquals(com.example.ui.AuthStage.CREATE_MPIN, vm.authStage.value)
 
-        vm.repo.prefs.saveMpin("654321")
-        val vmWithPin = androidx.lifecycle.ViewModelProvider(
-            androidx.lifecycle.ViewModelStore(),
-            factory
-        )[com.example.ui.DskLockerViewModel::class.java]
-        assertEquals(com.example.ui.AuthStage.MPIN_LOGIN, vmWithPin.authStage.value)
+            vm.repo.prefs.saveMpin("654321")
+            val vmWithPin = androidx.lifecycle.ViewModelProvider(
+                storeWithPin,
+                factory
+            )[com.example.ui.DskLockerViewModel::class.java]
+            assertEquals(com.example.ui.AuthStage.MPIN_LOGIN, vmWithPin.authStage.value)
 
-        vmWithPin.startForgotMpin()
-        assertEquals(com.example.ui.AuthStage.CREATE_MPIN, vmWithPin.authStage.value)
-        vmWithPin.cancelForgotMpin()
-        assertEquals(com.example.ui.AuthStage.MPIN_LOGIN, vmWithPin.authStage.value)
+            vmWithPin.startForgotMpin()
+            assertEquals(com.example.ui.AuthStage.CREATE_MPIN, vmWithPin.authStage.value)
+            vmWithPin.cancelForgotMpin()
+            assertEquals(com.example.ui.AuthStage.MPIN_LOGIN, vmWithPin.authStage.value)
+        } finally {
+            store.clear()
+            storeWithPin.clear()
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                DskLockerDatabase.getInstance(app).clearAllTables()
+            }
+        }
     }
 
     @Test
-    fun `login mpin supports 4 and 6 digits and secret mpin rejects matching login mpin`() {
+    fun `login mpin supports 4 and 6 digits and secret mpin rejects matching login mpin`() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         com.google.firebase.FirebaseApp.initializeApp(app)
         com.example.security.configureAppCheck(app, null)
-        val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(app)
-        val vm = androidx.lifecycle.ViewModelProvider(
-            androidx.lifecycle.ViewModelStore(),
-            factory
-        )[com.example.ui.DskLockerViewModel::class.java]
+        val store = androidx.lifecycle.ViewModelStore()
+        try {
+            val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory(app)
+            val vm = androidx.lifecycle.ViewModelProvider(
+                store,
+                factory
+            )[com.example.ui.DskLockerViewModel::class.java]
 
-        vm.repo.prefs.saveMpin("2580")
-        assertTrue(vm.repo.prefs.hasMpin())
-        assertEquals(4, vm.loginMpinLength())
-        assertTrue(vm.repo.prefs.verifyMpin("2580"))
-        assertFalse(vm.repo.prefs.verifyMpin("1234"))
+            vm.repo.prefs.saveMpin("2580")
+            assertTrue(vm.repo.prefs.hasMpin())
+            assertEquals(4, vm.loginMpinLength())
+            assertTrue(vm.repo.prefs.verifyMpin("2580"))
+            assertFalse(vm.repo.prefs.verifyMpin("1234"))
 
-        // Secret MPIN not yet set -> blocks delete verification
-        assertFalse(vm.hasSecretMpin())
-        assertFalse(vm.verifySecretMpinForDelete("9999"))
+            // Secret MPIN not yet set -> blocks delete verification
+            assertFalse(vm.hasSecretMpin())
+            assertFalse(vm.verifySecretMpinForDelete("9999"))
 
-        // Rejects matching Login MPIN
-        val samePinResult = vm.setOrChangeSecretMpin("2580", "2580")
-        assertTrue(samePinResult.isFailure)
-        assertFalse(vm.hasSecretMpin())
+            // Rejects matching Login MPIN
+            val samePinResult = vm.setOrChangeSecretMpin("2580", "2580")
+            assertTrue(samePinResult.isFailure)
+            assertFalse(vm.hasSecretMpin())
 
-        // Accepts distinct 6-digit Secret MPIN
-        val validSecretResult = vm.setOrChangeSecretMpin("908172", "908172")
-        assertTrue(validSecretResult.isSuccess)
-        assertTrue(vm.hasSecretMpin())
-        assertEquals(6, vm.secretMpinLength())
-        assertTrue(vm.verifySecretMpinForDelete("908172"))
-        assertFalse(vm.verifySecretMpinForDelete("2580"))
+            // Accepts distinct 6-digit Secret MPIN
+            val validSecretResult = vm.setOrChangeSecretMpin("908172", "908172")
+            assertTrue(validSecretResult.isSuccess)
+            assertTrue(vm.hasSecretMpin())
+            assertEquals(6, vm.secretMpinLength())
+            assertTrue(vm.verifySecretMpinForDelete("908172"))
+            assertFalse(vm.verifySecretMpinForDelete("2580"))
+        } finally {
+            store.clear()
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                DskLockerDatabase.getInstance(app).clearAllTables()
+            }
+        }
     }
 
     @Test
@@ -424,20 +444,21 @@ class ExampleRobolectricTest {
             val vm = androidx.lifecycle.ViewModelProvider(store, factory)[com.example.ui.DskLockerViewModel::class.java]
 
             vm.repo.ensureDefaultsInitialized()
+            collectJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate).launch {
+                vm.settings.collect {}
+            }
             vm.repo.updateSettings { it.copy(autoLockSeconds = 0) }
             vm.createMpin("482910", "482910")
             vm.finishPostAuthSplash()
             Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
             assertEquals(com.example.ui.AuthStage.UNLOCKED_APP, vm.authStage.value)
 
-            // Ensure settings StateFlow receives autoLockSeconds = 0
-            collectJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate).launch {
-                vm.settings.collect {}
-            }
+            // Wait up to 5s for Room InvalidationTracker + stateIn flow emission on CI runners
             var waitTicks = 0
-            while ((vm.settings.value?.autoLockSeconds ?: 120) != 0 && waitTicks < 40) {
+            while ((vm.settings.value?.autoLockSeconds ?: 120) != 0 && waitTicks < 200) {
                 Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
                 kotlinx.coroutines.delay(25L)
+                Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
                 waitTicks++
             }
             assertEquals(0, vm.settings.value?.autoLockSeconds)
