@@ -63,15 +63,19 @@ class AutoBackupWorker(
         if (!BackendConfig.isSqlBackendConfigured) {
             return Result.success()
         }
-        val repo = DskLockerRepository(applicationContext)
-        val isManual = inputData.getBoolean("manual", false)
-        val summary = repo.runNeonCloudBackup(isManual = isManual)
+        return try {
+            val repo = DskLockerRepository(applicationContext)
+            val isManual = inputData.getBoolean("manual", false)
+            val summary = repo.runNeonCloudBackup(isManual = isManual)
 
-        // If transient offline/network error occurred and attempts remain, ask WorkManager to retry cleanly
-        return if (summary.transientRetryNeeded && runAttemptCount < 4) {
-            Result.retry()
-        } else {
-            Result.success()
+            // If transient offline/network error occurred and attempts remain, ask WorkManager to retry cleanly
+            if (summary.transientRetryNeeded && runAttemptCount < 4) {
+                Result.retry()
+            } else {
+                Result.success()
+            }
+        } catch (_: Throwable) {
+            if (runAttemptCount < 4) Result.retry() else Result.failure()
         }
     }
 }
@@ -276,6 +280,21 @@ object BackupScheduler {
         return "%02d:%02d %s".format(displayH, safeM, amPm)
     }
 
+    private const val SCHEDULER_PREFS = "dsk_backup_scheduler_prefs"
+    private const val KEY_LAST_SIGNATURE = "last_periodic_signature"
+
+    fun computeScheduleSignature(
+        enabled: Boolean,
+        wifiOnly: Boolean,
+        chargingOnly: Boolean,
+        frequency: String,
+        hour: Int,
+        minute: Int
+    ): String {
+        val freq = BackupFrequency.fromId(frequency)
+        return "$enabled|$wifiOnly|$chargingOnly|${freq.id}|${hour.coerceIn(0, 23)}|${minute.coerceIn(0, 59)}"
+    }
+
     fun schedulePeriodicAutoBackup(
         context: Context,
         enabled: Boolean,
@@ -283,14 +302,25 @@ object BackupScheduler {
         chargingOnly: Boolean = false,
         frequency: String = BackupFrequency.DAILY.id,
         hour: Int = 2,
-        minute: Int = 0
-    ) {
-        val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
+        minute: Int = 0,
+        forceUpdate: Boolean = false
+    ): ExistingPeriodicWorkPolicy? {
+        val schedulerPrefs = context.getSharedPreferences(SCHEDULER_PREFS, Context.MODE_PRIVATE)
+        val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return null
         if (!enabled) {
+            schedulerPrefs.edit().remove(KEY_LAST_SIGNATURE).apply()
             wm.cancelUniqueWork(PERIODIC_WORK_NAME)
-            return
+            return null
         }
         val freq = BackupFrequency.fromId(frequency)
+        val signature = computeScheduleSignature(true, wifiOnly, chargingOnly, freq.id, hour, minute)
+        val previousSignature = schedulerPrefs.getString(KEY_LAST_SIGNATURE, null)
+        val policy = if (!forceUpdate && previousSignature == signature) {
+            ExistingPeriodicWorkPolicy.KEEP
+        } else {
+            ExistingPeriodicWorkPolicy.UPDATE
+        }
+
         val netType = if (wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(netType)
@@ -304,9 +334,13 @@ object BackupScheduler {
             .build()
         wm.enqueueUniquePeriodicWork(
             PERIODIC_WORK_NAME,
-            ExistingPeriodicWorkPolicy.UPDATE,
+            policy,
             request
         )
+        if (policy == ExistingPeriodicWorkPolicy.UPDATE) {
+            schedulerPrefs.edit().putString(KEY_LAST_SIGNATURE, signature).apply()
+        }
+        return policy
     }
 
     suspend fun syncScheduleFromDatabase(context: Context) {

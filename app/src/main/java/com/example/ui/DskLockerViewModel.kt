@@ -105,6 +105,19 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     )
     val deleteProtectionEnabled: StateFlow<Boolean> = _deleteProtectionEnabled.asStateFlow()
 
+    private val _loginMpinLength = MutableStateFlow(
+        runCatching { repo.prefs.getMpinLength() }.getOrDefault(6)
+    )
+    val loginMpinLengthState: StateFlow<Int> = _loginMpinLength.asStateFlow()
+
+    private val _biometricEnabled = MutableStateFlow(
+        runCatching { repo.prefs.biometricEnabled }.getOrDefault(false)
+    )
+    val biometricEnabledState: StateFlow<Boolean> = _biometricEnabled.asStateFlow()
+
+    @Volatile
+    private var externalActivityLockSuppressedUntilMs: Long = 0L
+
     private val _flashState = MutableStateFlow(FlashScreenState())
     val flashState: StateFlow<FlashScreenState> = _flashState.asStateFlow()
 
@@ -288,6 +301,10 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
     suspend fun getVideoPreviewMeta(file: FileItemEntity): LocalFileManager.VideoPreviewMeta =
         repo.getVideoPreviewMeta(file)
 
+    fun linkedOwnerEmail(): String? =
+        repo.prefs.ownerEmail?.takeIf { it.isNotBlank() }
+            ?: repo.phoneAuth.currentUser()?.email?.takeIf { it.isNotBlank() }
+
     fun hasLinkedCloudAccount(): Boolean =
         !repo.prefs.firebaseUid.isNullOrBlank() ||
             repo.hasFirebaseSession() ||
@@ -315,12 +332,14 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         onVerified: () -> Unit,
         onError: (String) -> Unit
     ) {
+        suppressAutoLockForExternalActivity()
         viewModelScope.launch {
             val activeUser = repo.phoneAuth.currentUser()
             val expectedUid = repo.prefs.firebaseUid
             if (activeUser != null && (expectedUid.isNullOrBlank() || activeUser.uid == expectedUid)) {
                 val freshToken = repo.phoneAuth.getFreshIdToken(true)
                 if (!freshToken.isNullOrBlank()) {
+                    clearExternalActivityLockSuppression()
                     repo.logSecurity("FORGOT_MPIN_CLOUD_SESSION_VERIFIED", "Owner verified active cloud session (${activeUser.uid})", true)
                     onVerified()
                     return@launch
@@ -328,12 +347,55 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
             }
             when (val res = repo.signInWithGoogle(uiContext)) {
                 is GoogleSignInResult.Success -> {
+                    clearExternalActivityLockSuppression()
                     _cloudSessionActive.value = true
+                    _cloudEmailVerified.value = repo.currentUserEmailVerified()
                     repo.logSecurity("FORGOT_MPIN_GOOGLE_VERIFIED", "Owner verified via Google Sign-In (${res.session.uid})", true)
                     onVerified()
                 }
-                is GoogleSignInResult.Cancelled -> onError("Cloud account verification cancelled.")
-                is GoogleSignInResult.Error -> onError(res.message)
+                is GoogleSignInResult.Cancelled -> {
+                    clearExternalActivityLockSuppression()
+                    onError("Cloud account verification cancelled.")
+                }
+                is GoogleSignInResult.Error -> {
+                    clearExternalActivityLockSuppression()
+                    onError(res.message)
+                }
+            }
+        }
+    }
+
+    fun verifyEmailOwnerForMpinReset(
+        email: String,
+        password: String,
+        onVerified: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val cleanEmail = email.trim()
+        if (!AuthValidation.isValidEmail(cleanEmail)) {
+            onError("Enter a valid email address.")
+            return
+        }
+        if (password.isEmpty()) {
+            onError("Enter your cloud account password.")
+            return
+        }
+        val expectedEmail = repo.prefs.ownerEmail?.takeIf { it.isNotBlank() }
+        if (expectedEmail != null && !expectedEmail.equals(cleanEmail, ignoreCase = true)) {
+            onError("Single-owner lock: enter the linked owner email ($expectedEmail).")
+            return
+        }
+        viewModelScope.launch {
+            when (val res = repo.signInWithEmail(cleanEmail, password)) {
+                is EmailAuthResult.Success -> {
+                    _cloudSessionActive.value = true
+                    _cloudEmailVerified.value = repo.currentUserEmailVerified()
+                    repo.logSecurity("FORGOT_MPIN_EMAIL_VERIFIED", "Owner verified via Email/Password (${res.session.uid})", true)
+                    onVerified()
+                }
+                is EmailAuthResult.Error -> {
+                    onError(res.message)
+                }
             }
         }
     }
@@ -357,25 +419,30 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
             _authError.value = "MPIN entries do not match."
             return
         }
+        repo.prefs.saveMpin(pin)
+        _loginMpinLength.value = repo.prefs.getMpinLength()
+        _isForgotMpinFlow.value = false
+        _authError.value = null
+        val avail = biometricAvailability()
+        if (avail is BiometricAvailability.Available && !repo.prefs.biometricEnabled) {
+            _authStage.value = AuthStage.BIOMETRIC_SETUP
+        } else {
+            triggerPostAuthSplash()
+        }
         viewModelScope.launch {
-            repo.saveNewMpin(pin)
-            _isForgotMpinFlow.value = false
-            _authError.value = null
-            val avail = biometricAvailability()
-            if (avail is BiometricAvailability.Available && !repo.prefs.biometricEnabled) {
-                _authStage.value = AuthStage.BIOMETRIC_SETUP
-            } else {
-                triggerPostAuthSplash()
-            }
+            repo.syncStoredMpinToBackend(pin.length)
+            repo.logSecurity("MPIN_UPDATED", "Owner ${pin.length}-digit PBKDF2 MPIN hash updated securely", true)
         }
     }
 
     fun completeBiometricSetup(enrolled: Boolean) {
         repo.prefs.biometricEnabled = enrolled
+        _biometricEnabled.value = enrolled
         viewModelScope.launch {
             if (enrolled) {
                 repo.logSecurity("BIOMETRIC_ENROLLED", "Hardware biometric unlock enabled", true)
             }
+            repo.syncStoredMpinToBackend()
             triggerPostAuthSplash()
         }
     }
@@ -459,19 +526,39 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun onAppBackgrounded() {
-        repo.prefs.lastBackgroundMs = System.currentTimeMillis()
+    fun suppressAutoLockForExternalActivity(windowMs: Long = 180_000L) {
+        externalActivityLockSuppressedUntilMs = System.currentTimeMillis() + windowMs
+    }
+
+    fun clearExternalActivityLockSuppression() {
+        externalActivityLockSuppressedUntilMs = 0L
+    }
+
+    fun onAppBackgrounded(nowMs: Long = System.currentTimeMillis()) {
+        if (nowMs < externalActivityLockSuppressedUntilMs) {
+            // In-app pickers, scanners, SAF exports, external Shares, CredentialManager, and Biometric prompts
+            // stop MainActivity briefly; keep the current session and any preview cache intact while returning.
+            repo.prefs.lastBackgroundMs = 0L
+            return
+        }
+        repo.prefs.lastBackgroundMs = nowMs
         LocalFileManager.wipeVaultPreviewCache(getApplication())
         if ((settings.value?.autoLockSeconds ?: 120) == 0) {
             lockAppNow()
         }
     }
 
-    fun onAppForegrounded() {
+    fun onAppForegrounded(nowMs: Long = System.currentTimeMillis()) {
+        val wasSuppressed = externalActivityLockSuppressedUntilMs > 0L
+        externalActivityLockSuppressedUntilMs = 0L
+        if (wasSuppressed) {
+            repo.prefs.lastBackgroundMs = 0L
+            return
+        }
         val lastBg = repo.prefs.lastBackgroundMs
         val timeoutSec = settings.value?.autoLockSeconds ?: 120
         if (lastBg > 0 && timeoutSec > 0 && _authStage.value == AuthStage.UNLOCKED_APP) {
-            val elapsedSec = (System.currentTimeMillis() - lastBg) / 1000L
+            val elapsedSec = (nowMs - lastBg) / 1000L
             if (elapsedSec >= timeoutSec) {
                 lockAppNow()
             }
@@ -968,8 +1055,10 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         _cloudAuthError.value = null
         _cloudAuthNotice.value = null
         _cloudAuthLoading.value = true
+        suppressAutoLockForExternalActivity()
         viewModelScope.launch {
             val result = repo.signInWithGoogle(uiContext)
+            clearExternalActivityLockSuppression()
             _cloudAuthLoading.value = false
             _cloudSessionActive.value = repo.hasFirebaseSession()
             _cloudEmailVerified.value = repo.currentUserEmailVerified()
@@ -1715,7 +1804,9 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun toggleBiometricSetting(enabled: Boolean) {
         repo.prefs.biometricEnabled = enabled
+        _biometricEnabled.value = enabled
         viewModelScope.launch {
+            repo.syncStoredMpinToBackend()
             repo.logSecurity(
                 if (enabled) "BIOMETRIC_ENABLED" else "BIOMETRIC_REMOVED",
                 if (enabled) "Biometric unlock enabled" else "Biometric unlock removed by owner",
@@ -1732,8 +1823,11 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
         if (repo.prefs.hasSecretMpin() && repo.prefs.verifySecretMpin(newPin)) {
             return Result.failure(IllegalArgumentException("Login MPIN must be different from your Secret MPIN."))
         }
+        repo.prefs.saveMpin(newPin)
+        _loginMpinLength.value = repo.prefs.getMpinLength()
         viewModelScope.launch {
-            repo.saveNewMpin(newPin)
+            repo.syncStoredMpinToBackend(newPin.length)
+            repo.logSecurity("MPIN_UPDATED", "Owner ${newPin.length}-digit PBKDF2 MPIN hash updated securely", true)
             _statusBanner.value = "Login ${newPin.length}-digit MPIN updated successfully."
         }
         return Result.success(Unit)

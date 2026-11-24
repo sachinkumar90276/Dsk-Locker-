@@ -127,6 +127,7 @@ fun DocumentScannerScreen(
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
+        viewModel.clearExternalActivityLockSuppression()
         hasCameraPermission = granted
         if (!granted) {
             cameraPermissionDeniedOnce = true
@@ -153,6 +154,7 @@ fun DocumentScannerScreen(
     val gmsScannerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
+        viewModel.clearExternalActivityLockSuppression()
         if (result.resultCode == Activity.RESULT_OK) {
             val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
             val uris = mutableListOf<Uri>()
@@ -184,11 +186,13 @@ fun DocumentScannerScreen(
         if (activity == null) {
             scannerMessage = "Activity unavailable for ML Kit Document Scanner."
         } else {
+            viewModel.suppressAutoLockForExternalActivity()
             gmsScannerClient.getStartScanIntent(activity)
                 .addOnSuccessListener { intentSender ->
                     gmsScannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
                 }
                 .addOnFailureListener { err ->
+                    viewModel.clearExternalActivityLockSuppression()
                     scannerMessage = err.localizedMessage
                         ?: "ML Kit Auto-Crop Scanner module unavailable on this device; use the live CameraX scanner below."
                 }
@@ -297,7 +301,10 @@ fun DocumentScannerScreen(
             !hasCameraPermission -> {
                 CameraPermissionRequestPane(
                     deniedOnce = cameraPermissionDeniedOnce,
-                    onRequestPermission = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                    onRequestPermission = {
+                        viewModel.suppressAutoLockForExternalActivity()
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                    },
                     onLaunchGmsScanner = launchGmsScanner
                 )
             }

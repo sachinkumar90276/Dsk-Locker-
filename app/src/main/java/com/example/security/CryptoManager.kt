@@ -1,5 +1,6 @@
 package com.example.security
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -9,6 +10,7 @@ import java.io.OutputStream
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.Security
 import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
 import javax.crypto.CipherOutputStream
@@ -30,30 +32,46 @@ object CryptoManager {
     @Volatile
     private var jvmTestFallbackKey: SecretKey? = null
 
-    private fun getOrCreateMasterKey(): SecretKey {
-        return try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            val existing = keyStore.getKey(KEY_ALIAS, null) as? SecretKey
-            if (existing != null) return existing
+    private fun isAndroidKeyStoreAvailable(): Boolean {
+        val isRobolectric = Build.FINGERPRINT?.equals("robolectric", ignoreCase = true) == true
+        if (isRobolectric) return false
+        return Security.getProvider(ANDROID_KEYSTORE) != null
+    }
 
-            val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
-            val spec = KeyGenParameterSpec.Builder(
-                KEY_ALIAS,
-                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-            )
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                .build()
-            keyGenerator.init(spec)
-            keyGenerator.generateKey()
-        } catch (_: Throwable) {
-            // Fallback AES-256 key if AndroidKeyStore is unavailable or fails
-            jvmTestFallbackKey ?: synchronized(this) {
+    private fun getOrCreateMasterKey(): SecretKey {
+        if (!isAndroidKeyStoreAvailable()) {
+            return jvmTestFallbackKey ?: synchronized(this) {
                 jvmTestFallbackKey ?: KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
                     .also { jvmTestFallbackKey = it }
             }
         }
+
+        var lastError: Throwable? = null
+        repeat(2) { attempt ->
+            try {
+                val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                val existing = keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+                if (existing != null) return existing
+
+                val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+                val spec = KeyGenParameterSpec.Builder(
+                    KEY_ALIAS,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build()
+                keyGenerator.init(spec)
+                return keyGenerator.generateKey()
+            } catch (t: Throwable) {
+                lastError = t
+                if (attempt == 0) {
+                    runCatching { Thread.sleep(50L) }
+                }
+            }
+        }
+        throw IllegalStateException("AndroidKeyStore master key unavailable", lastError)
     }
 
     fun encryptString(plainText: String): String {

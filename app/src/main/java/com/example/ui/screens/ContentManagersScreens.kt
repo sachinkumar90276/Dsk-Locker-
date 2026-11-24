@@ -612,6 +612,7 @@ fun LinksManagerScreen(
                                 onPlayDirectVideoUrl(normalized, link.title)
                             } else {
                                 runCatching {
+                                    viewModel.suppressAutoLockForExternalActivity()
                                     context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(normalized)))
                                 }
                             }

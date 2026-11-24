@@ -12,6 +12,7 @@ import com.example.data.local.FileItemEntity
 import com.example.data.local.OwnerProfileEntity
 import com.example.security.CryptoManager
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -19,15 +20,26 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class ExampleRobolectricTest {
+
+    @Before
+    fun resetPrefsForIsolation() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.getSharedPreferences("dsk_locker_secure_store", Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
+    }
 
     @Test
     fun `app name matches DSK LOCKER`() {
@@ -369,5 +381,124 @@ class ExampleRobolectricTest {
         assertEquals("IMG_20261121.jpg", withRename?.originalFilename)
         assertEquals("PAN Card - Aarav Mehta", withRename?.displayName)
     }
+
+    @Test
+    fun `changeMpin and toggleBiometricSetting update reactive StateFlows synchronously`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        com.google.firebase.FirebaseApp.initializeApp(app)
+        com.example.security.configureAppCheck(app, null)
+        val store = androidx.lifecycle.ViewModelStore()
+        try {
+            val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory(app)
+            val vm = androidx.lifecycle.ViewModelProvider(store, factory)[com.example.ui.DskLockerViewModel::class.java]
+
+            vm.createMpin("123456", "123456")
+            assertEquals(6, vm.loginMpinLengthState.value)
+
+            val changed = vm.changeMpin("2580")
+            assertTrue(changed.isSuccess)
+            assertEquals(4, vm.loginMpinLengthState.value)
+
+            vm.toggleBiometricSetting(true)
+            assertTrue(vm.biometricEnabledState.value)
+            vm.toggleBiometricSetting(false)
+            assertFalse(vm.biometricEnabledState.value)
+        } finally {
+            store.clear()
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                DskLockerDatabase.getInstance(app).clearAllTables()
+            }
+        }
+    }
+
+    @Test
+    fun `external activity lock suppression keeps autoLockSeconds 0 unlocked during pickers then clears cleanly`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        com.google.firebase.FirebaseApp.initializeApp(app)
+        com.example.security.configureAppCheck(app, null)
+        val store = androidx.lifecycle.ViewModelStore()
+        var collectJob: kotlinx.coroutines.Job? = null
+        try {
+            val factory = androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory(app)
+            val vm = androidx.lifecycle.ViewModelProvider(store, factory)[com.example.ui.DskLockerViewModel::class.java]
+
+            vm.repo.ensureDefaultsInitialized()
+            vm.repo.updateSettings { it.copy(autoLockSeconds = 0) }
+            vm.createMpin("482910", "482910")
+            vm.finishPostAuthSplash()
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            assertEquals(com.example.ui.AuthStage.UNLOCKED_APP, vm.authStage.value)
+
+            // Ensure settings StateFlow receives autoLockSeconds = 0
+            collectJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate).launch {
+                vm.settings.collect {}
+            }
+            var waitTicks = 0
+            while ((vm.settings.value?.autoLockSeconds ?: 120) != 0 && waitTicks < 40) {
+                Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                kotlinx.coroutines.delay(25L)
+                waitTicks++
+            }
+            assertEquals(0, vm.settings.value?.autoLockSeconds)
+
+            // While external picker/scanner/SAF is active, backgrounding MUST NOT lock the app
+            vm.suppressAutoLockForExternalActivity(60_000L)
+            vm.onAppBackgrounded()
+            assertEquals(com.example.ui.AuthStage.UNLOCKED_APP, vm.authStage.value)
+
+            // Returning clears suppression; subsequent genuine backgrounding MUST lock immediately
+            vm.onAppForegrounded()
+            assertEquals(com.example.ui.AuthStage.UNLOCKED_APP, vm.authStage.value)
+            vm.onAppBackgrounded()
+            assertEquals(com.example.ui.AuthStage.MPIN_LOGIN, vm.authStage.value)
+        } finally {
+            collectJob?.cancel()
+            store.clear()
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                DskLockerDatabase.getInstance(app).clearAllTables()
+            }
+        }
+    }
+
+    @Test
+    fun `mobile only deletion without cloud backup preserves local file in recycle bin for restore`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = DskLockerDatabase.getInstance(context)
+        val repo = DskLockerRepository(context)
+
+        val localFile = File(context.cacheDir, "unbacked_contract.pdf").apply {
+            writeText("Unbacked Private Contract Content")
+        }
+        val item = FileItemEntity(
+            id = "local-trash-1",
+            originalFilename = "unbacked_contract.pdf",
+            displayName = "Unbacked Contract",
+            categoryId = DskCategories.CAT_DOCUMENTS,
+            mimeType = "application/pdf",
+            sizeBytes = localFile.length(),
+            localPath = localFile.absolutePath,
+            cloudPath = null,
+            backupStatus = BackupStatus.BACKUP_PENDING
+        )
+        db.fileItemDao().upsert(item)
+
+        repo.deleteFileWithMode(item, DeleteMode.MOBILE_ONLY)
+
+        val trashed = db.fileItemDao().getFileById("local-trash-1")
+        assertNotNull(trashed)
+        assertTrue(trashed!!.isDeleted)
+        assertEquals(localFile.absolutePath, trashed.localPath)
+        assertTrue(localFile.exists())
+
+        repo.restoreFromTrash(trashed)
+        val restored = db.fileItemDao().getFileById("local-trash-1")
+        assertNotNull(restored)
+        assertFalse(restored!!.isDeleted)
+        assertTrue(localFile.exists())
+        assertEquals("Unbacked Private Contract Content", localFile.readText())
+    }
 }
+
 

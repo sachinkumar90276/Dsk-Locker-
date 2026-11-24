@@ -101,6 +101,7 @@ fun FileViewerScreen(
     val createDocLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument(fileItem?.mimeType ?: "*/*")
     ) { uri ->
+        viewModel.clearExternalActivityLockSuppression()
         if (uri != null && fileItem != null) {
             viewModel.exportFileToSafUri(fileItem, uri)
         }
@@ -108,7 +109,9 @@ fun FileViewerScreen(
 
     val notificationPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
-    ) { _ -> }
+    ) { _ ->
+        viewModel.clearExternalActivityLockSuppression()
+    }
 
     LaunchedEffect(fileItem) {
         resolving = true
@@ -184,6 +187,7 @@ fun FileViewerScreen(
                 enabled = resolvedFile != null,
                 onClick = {
                     resolvedFile?.let { f ->
+                        viewModel.suppressAutoLockForExternalActivity()
                         val intent = LocalFileManager.buildShareOrOpenIntent(context, f, fileItem.mimeType, isShare = true)
                         runCatching { context.startActivity(Intent.createChooser(intent, "Share via")) }
                     }
@@ -232,7 +236,10 @@ fun FileViewerScreen(
                     Text("DOWNLOAD TO PHONE", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
                 OutlinedButton(
-                    onClick = { createDocLauncher.launch(fileItem.originalFilename) },
+                    onClick = {
+                        viewModel.suppressAutoLockForExternalActivity()
+                        createDocLauncher.launch(fileItem.originalFilename)
+                    },
                     enabled = resolvedFile != null,
                     border = BorderStroke(1.dp, ElectricBlue)
                 ) {
@@ -273,6 +280,7 @@ fun FileViewerScreen(
                 file = resolvedFile!!,
                 fileItem = fileItem,
                 onOpenExternal = {
+                    viewModel.suppressAutoLockForExternalActivity()
                     val intent = LocalFileManager.buildShareOrOpenIntent(context, resolvedFile!!, fileItem.mimeType, isShare = false)
                     runCatching { context.startActivity(Intent.createChooser(intent, "Open With Compatible App")) }
                 }
@@ -301,6 +309,7 @@ fun FileViewerScreen(
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                     ) {
+                        viewModel.suppressAutoLockForExternalActivity()
                         notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                     }
                     viewModel.saveExpiryReminder(rem)

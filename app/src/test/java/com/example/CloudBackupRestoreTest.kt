@@ -50,6 +50,11 @@ class CloudBackupRestoreTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
+        runBlocking(Dispatchers.IO) {
+            DskLockerDatabase.getInstance(context).clearAllTables()
+        }
+        context.getSharedPreferences("dsk_locker_secure_store", Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("dsk_backup_scheduler_prefs", Context.MODE_PRIVATE).edit().clear().commit()
         server = FakeRenderNeonServer()
         baseUrl = server.start()
     }
@@ -556,6 +561,100 @@ class CloudBackupRestoreTest {
         BackupScheduler.syncScheduleFromDatabase(context)
     }
 
+    @Test
+    fun `cold-start 503 retry recovers within 3 attempts and exhausted 503 queues BACKUP_PENDING for retry`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        val db = DskLockerDatabase.getInstance(context)
+        val doc = File(context.filesDir, "cold_start_retry.pdf").apply {
+            writeText("%PDF-1.4\nCold start recovery test")
+        }
+        val item = FileItemEntity(
+            id = "cold-retry-1",
+            originalFilename = "cold_start_retry.pdf",
+            displayName = "Cold Retry Doc",
+            categoryId = DskCategories.CAT_DOCUMENTS,
+            mimeType = "application/pdf",
+            sizeBytes = doc.length(),
+            localPath = doc.absolutePath,
+            backupStatus = BackupStatus.BACKUP_PENDING,
+            sha256 = CryptoManager.sha256File(doc)
+        )
+        db.fileItemDao().upsert(item)
+
+        // Two consecutive 503 responses followed by 200 -> SqlBackendClient retries and succeeds
+        try {
+            server.remainingCreate503Failures = 2
+            val recoveredSummary = repo.runNeonCloudBackup(filesToBackup = listOf(item), isManual = true)
+            assertEquals(1, recoveredSummary.uploadedCount)
+            assertEquals(0, recoveredSummary.failedCount)
+            assertFalse(recoveredSummary.transientRetryNeeded)
+            assertEquals(BackupStatus.MOBILE_AND_CLOUD, db.fileItemDao().getFileById("cold-retry-1")?.backupStatus)
+
+            // Four consecutive 503 responses exhausts client's 3-attempt retry -> marks BACKUP_PENDING & transientRetryNeeded = true
+            val item2 = item.copy(id = "cold-retry-2", backupStatus = BackupStatus.BACKUP_PENDING)
+            db.fileItemDao().upsert(item2)
+            server.remainingCreate503Failures = 4
+            val pendingSummary = repo.runNeonCloudBackup(filesToBackup = listOf(item2), isManual = true)
+            assertEquals(0, pendingSummary.uploadedCount)
+            assertTrue(pendingSummary.transientRetryNeeded)
+            assertEquals(BackupStatus.BACKUP_PENDING, db.fileItemDao().getFileById("cold-retry-2")?.backupStatus)
+            assertTrue(doc.exists())
+        } finally {
+            db.fileItemDao().hardDeleteById("cold-retry-1")
+            db.fileItemDao().hardDeleteById("cold-retry-2")
+            doc.delete()
+            server.remainingCreate503Failures = 0
+        }
+    }
+
+    @Test
+    fun `BackupScheduler uses UPDATE on first call or config change and KEEP on repeated identical schedules`() {
+        runCatching {
+            androidx.work.WorkManager.initialize(
+                context,
+                androidx.work.Configuration.Builder().build()
+            )
+        }
+        BackupScheduler.schedulePeriodicAutoBackup(context = context, enabled = false, wifiOnly = true)
+
+        val first = BackupScheduler.schedulePeriodicAutoBackup(
+            context = context,
+            enabled = true,
+            wifiOnly = true,
+            chargingOnly = false,
+            frequency = BackupFrequency.DAILY.id,
+            hour = 2,
+            minute = 0
+        )
+        assertEquals(androidx.work.ExistingPeriodicWorkPolicy.UPDATE, first)
+
+        val repeated = BackupScheduler.schedulePeriodicAutoBackup(
+            context = context,
+            enabled = true,
+            wifiOnly = true,
+            chargingOnly = false,
+            frequency = BackupFrequency.DAILY.id,
+            hour = 2,
+            minute = 0
+        )
+        assertEquals(androidx.work.ExistingPeriodicWorkPolicy.KEEP, repeated)
+
+        val changed = BackupScheduler.schedulePeriodicAutoBackup(
+            context = context,
+            enabled = true,
+            wifiOnly = false,
+            chargingOnly = true,
+            frequency = BackupFrequency.WEEKLY.id,
+            hour = 22,
+            minute = 30
+        )
+        assertEquals(androidx.work.ExistingPeriodicWorkPolicy.UPDATE, changed)
+    }
+
     /**
      * Lightweight real HTTP server emulating the Render + Neon Cloud Backup API endpoints for OkHttp integration tests.
      */
@@ -570,6 +669,7 @@ class CloudBackupRestoreTest {
 
         @Volatile var forceNextCreateErrorCode: Int? = null
         @Volatile var forceNextCreateErrorMessage: String? = null
+        @Volatile var remainingCreate503Failures: Int = 0
         @Volatile var corruptDownloadForFileId: String? = null
         @Volatile var failNextHealthWith503: Boolean = false
 
@@ -736,6 +836,11 @@ class CloudBackupRestoreTest {
                 }
 
                 method == "POST" && path == "/api/backup/create" -> {
+                    if (remainingCreate503Failures > 0) {
+                        remainingCreate503Failures -= 1
+                        sendJson(ex, 503, JSONObject().put("error", "Service warming up"))
+                        return
+                    }
                     val errCode = forceNextCreateErrorCode
                     if (errCode != null) {
                         sendJson(ex, errCode, JSONObject().put("error", forceNextCreateErrorMessage ?: "Upload failed"))

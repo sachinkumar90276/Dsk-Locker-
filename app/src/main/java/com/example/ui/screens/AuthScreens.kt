@@ -19,6 +19,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -395,22 +397,29 @@ fun MpinLoginScreen(viewModel: DskLockerViewModel) {
     val activity = context as? FragmentActivity
     val error by viewModel.authError.collectAsState()
     val lockoutSeconds by viewModel.lockoutSeconds.collectAsState()
-    val biometricEnabled = remember { viewModel.isBiometricEnabled() }
-    val bioAvail = remember { viewModel.biometricAvailability() }
-    val pinLen = remember { viewModel.loginMpinLength() }
+    val biometricEnabled by viewModel.biometricEnabledState.collectAsState()
+    val bioAvail = remember(biometricEnabled) { viewModel.biometricAvailability() }
+    val pinLen by viewModel.loginMpinLengthState.collectAsState()
 
-    var pin by remember { mutableStateOf("") }
+    var pin by remember(pinLen) { mutableStateOf("") }
     var bioMessage by remember { mutableStateOf<String?>(null) }
     var showForgotConfirm by remember { mutableStateOf(false) }
 
     val triggerBiometric = {
         if (activity != null && bioAvail is BiometricAvailability.Available) {
+            viewModel.suppressAutoLockForExternalActivity()
             BiometricHelper.authenticate(
                 activity = activity,
                 title = "DSK LOCKER Biometric Unlock",
                 subtitle = "Authenticate to unlock your private universe",
-                onSuccess = { viewModel.onBiometricLoginSuccess() },
-                onFailure = { msg -> bioMessage = msg }
+                onSuccess = {
+                    viewModel.clearExternalActivityLockSuppression()
+                    viewModel.onBiometricLoginSuccess()
+                },
+                onFailure = { msg ->
+                    viewModel.clearExternalActivityLockSuppression()
+                    bioMessage = msg
+                }
             )
         } else if (bioAvail is BiometricAvailability.Unavailable) {
             bioMessage = bioAvail.reason
@@ -552,10 +561,15 @@ fun MpinLoginScreen(viewModel: DskLockerViewModel) {
         val canBiometricVerify = bioAvail is BiometricAvailability.Available
         val hasSecretVerify = viewModel.hasSecretMpin()
         val hasCloudVerify = viewModel.hasLinkedCloudAccount()
+        val linkedEmail = viewModel.linkedOwnerEmail()
         val hasAnyOwnerFactor = canBiometricVerify || hasSecretVerify || hasCloudVerify
 
         var secretPinInput by remember { mutableStateOf("") }
         var showSecretPad by remember { mutableStateOf(hasSecretVerify && !canBiometricVerify) }
+        var showEmailVerifyFields by remember { mutableStateOf(!linkedEmail.isNullOrBlank() && !canBiometricVerify && !hasSecretVerify) }
+        var emailVerifyInput by remember { mutableStateOf(linkedEmail.orEmpty()) }
+        var emailVerifyPassword by remember { mutableStateOf("") }
+        var emailVerifyPasswordVisible by remember { mutableStateOf(false) }
         var cloudVerifying by remember { mutableStateOf(false) }
         var gateError by remember { mutableStateOf<String?>(null) }
         val secretLen = viewModel.secretMpinLength()
@@ -604,16 +618,21 @@ fun MpinLoginScreen(viewModel: DskLockerViewModel) {
                                 if (activity == null) {
                                     gateError = "Biometric prompt unavailable in current window."
                                 } else {
+                                    viewModel.suppressAutoLockForExternalActivity()
                                     BiometricHelper.authenticate(
                                         activity = activity,
                                         title = "Verify Owner Identity",
                                         subtitle = "Authenticate to reset DSK LOCKER Login MPIN",
                                         onSuccess = {
+                                            viewModel.clearExternalActivityLockSuppression()
                                             showForgotConfirm = false
                                             viewModel.logForgotMpinVerified("Biometric")
                                             viewModel.startForgotMpin()
                                         },
-                                        onFailure = { msg -> gateError = msg }
+                                        onFailure = { msg ->
+                                            viewModel.clearExternalActivityLockSuppression()
+                                            gateError = msg
+                                        }
                                     )
                                 }
                             },
@@ -725,6 +744,94 @@ fun MpinLoginScreen(viewModel: DskLockerViewModel) {
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             Text("Verify Linked Cloud Account", color = EmeraldSync, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        if (!linkedEmail.isNullOrBlank()) {
+                            OutlinedButton(
+                                onClick = {
+                                    gateError = null
+                                    showEmailVerifyFields = !showEmailVerifyFields
+                                },
+                                enabled = !cloudVerifying,
+                                border = BorderStroke(1.dp, ElectricBlue.copy(alpha = 0.65f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .testTag("forgot_mpin_toggle_email")
+                            ) {
+                                Icon(Icons.Filled.Email, contentDescription = null, tint = ElectricBlue, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = if (showEmailVerifyFields) "Hide Email Verification" else "Verify with Email & Password",
+                                    color = SilverWhite
+                                )
+                            }
+
+                            if (showEmailVerifyFields) {
+                                OutlinedTextField(
+                                    value = emailVerifyInput,
+                                    onValueChange = {
+                                        emailVerifyInput = it
+                                        gateError = null
+                                    },
+                                    label = { Text("Linked Email") },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                OutlinedTextField(
+                                    value = emailVerifyPassword,
+                                    onValueChange = {
+                                        emailVerifyPassword = it
+                                        gateError = null
+                                    },
+                                    label = { Text("Password") },
+                                    singleLine = true,
+                                    visualTransformation = if (emailVerifyPasswordVisible) {
+                                        VisualTransformation.None
+                                    } else {
+                                        PasswordVisualTransformation()
+                                    },
+                                    trailingIcon = {
+                                        IconButton(onClick = { emailVerifyPasswordVisible = !emailVerifyPasswordVisible }) {
+                                            Icon(
+                                                imageVector = if (emailVerifyPasswordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                                contentDescription = "Toggle Password Visibility",
+                                                tint = MetallicSilver
+                                            )
+                                        }
+                                    },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Button(
+                                    onClick = {
+                                        gateError = null
+                                        cloudVerifying = true
+                                        viewModel.verifyEmailOwnerForMpinReset(
+                                            email = emailVerifyInput,
+                                            password = emailVerifyPassword,
+                                            onVerified = {
+                                                cloudVerifying = false
+                                                showForgotConfirm = false
+                                                viewModel.startForgotMpin()
+                                            },
+                                            onError = { msg ->
+                                                cloudVerifying = false
+                                                gateError = msg
+                                            }
+                                        )
+                                    },
+                                    enabled = !cloudVerifying,
+                                    colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(44.dp)
+                                        .testTag("forgot_mpin_verify_email_submit")
+                                ) {
+                                    Text("Verify Email & Reset MPIN", fontWeight = FontWeight.Bold)
+                                }
+                            }
                         }
                     }
                 }

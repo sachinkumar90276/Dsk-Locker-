@@ -1376,8 +1376,9 @@ fun ProfileSettingsScreen(
 
     val profile = profileState ?: OwnerProfileEntity()
     val settings = settingsState ?: UserSettingsEntity()
-    val bioAvail = remember { viewModel.biometricAvailability() }
-    var bioEnabled by remember { mutableStateOf(viewModel.isBiometricEnabled()) }
+    val bioEnabled by viewModel.biometricEnabledState.collectAsState()
+    val loginMpinLength by viewModel.loginMpinLengthState.collectAsState()
+    val bioAvail = remember(bioEnabled) { viewModel.biometricAvailability() }
 
     var showEditProfile by remember { mutableStateOf(false) }
     var showChangeMpinVerify by remember { mutableStateOf(false) }
@@ -1394,6 +1395,7 @@ fun ProfileSettingsScreen(
     val avatarPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
+        viewModel.clearExternalActivityLockSuppression()
         if (uri != null) {
             viewModel.updateProfile(profile.ownerName, uri)
         }
@@ -1413,6 +1415,7 @@ fun ProfileSettingsScreen(
                             .size(68.dp)
                             .clip(CircleShape)
                             .clickable {
+                                viewModel.suppressAutoLockForExternalActivity()
                                 avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                             }
                     ) {
@@ -1480,7 +1483,7 @@ fun ProfileSettingsScreen(
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "Security Status: Login MPIN (${viewModel.loginMpinLength()}-Digit) • Secret MPIN (${if (secretMpinConfigured) "${viewModel.secretMpinLength()}-Digit Active" else "Not Set"})",
+                    text = "Security Status: Login MPIN (${loginMpinLength}-Digit) • Secret MPIN (${if (secretMpinConfigured) "${viewModel.secretMpinLength()}-Digit Active" else "Not Set"})",
                     style = MaterialTheme.typography.labelSmall,
                     color = ElectricBlue
                 )
@@ -1530,15 +1533,18 @@ fun ProfileSettingsScreen(
                 ) { desired ->
                     if (desired) {
                         if (activity != null && bioAvail is BiometricAvailability.Available) {
+                            viewModel.suppressAutoLockForExternalActivity()
                             BiometricHelper.authenticate(
                                 activity = activity,
                                 title = "Enroll Biometric Unlock",
                                 subtitle = "Authenticate to enable biometric unlock",
                                 onSuccess = {
+                                    viewModel.clearExternalActivityLockSuppression()
                                     viewModel.toggleBiometricSetting(true)
-                                    bioEnabled = true
                                 },
-                                onFailure = { /* keep disabled */ }
+                                onFailure = {
+                                    viewModel.clearExternalActivityLockSuppression()
+                                }
                             )
                         }
                     } else {
@@ -1673,7 +1679,10 @@ fun ProfileSettingsScreen(
                 OutlinedTextField(value = nameInput, onValueChange = { nameInput = it }, label = { Text("Owner Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Spacer(modifier = Modifier.height(10.dp))
                 OutlinedButton(
-                    onClick = { avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                    onClick = {
+                        viewModel.suppressAutoLockForExternalActivity()
+                        avatarPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Change Profile Picture")
@@ -1693,10 +1702,10 @@ fun ProfileSettingsScreen(
     if (showChangeMpinVerify) {
         MpinVerificationDialog(
             title = "Verify Current Login MPIN",
-            subtitle = "Enter your existing ${viewModel.loginMpinLength()}-digit Login MPIN or tap Set New MPIN",
+            subtitle = "Enter your existing ${loginMpinLength}-digit Login MPIN or tap Set New MPIN",
             verifyMpin = viewModel::verifyMpinForAction,
             lockoutSeconds = lockoutSeconds,
-            maxDigits = viewModel.loginMpinLength(),
+            maxDigits = loginMpinLength,
             onDismiss = { showChangeMpinVerify = false },
             onVerified = {
                 showChangeMpinVerify = false
@@ -1711,7 +1720,7 @@ fun ProfileSettingsScreen(
     }
 
     if (showChangeMpinNew) {
-        var pinLen by remember { mutableIntStateOf(viewModel.loginMpinLength()) }
+        var pinLen by remember { mutableIntStateOf(loginMpinLength) }
         var newPin by remember { mutableStateOf("") }
         var confirmPin by remember { mutableStateOf("") }
         var confirmStep by remember { mutableStateOf(false) }
@@ -1964,11 +1973,10 @@ fun ProfileSettingsScreen(
             subtitle = "Enter Login MPIN to remove biometric binding",
             verifyMpin = viewModel::verifyMpinForAction,
             lockoutSeconds = lockoutSeconds,
-            maxDigits = viewModel.loginMpinLength(),
+            maxDigits = loginMpinLength,
             onDismiss = { showRemoveBioMpin = false },
             onVerified = {
                 viewModel.toggleBiometricSetting(false)
-                bioEnabled = false
                 showRemoveBioMpin = false
             }
         )

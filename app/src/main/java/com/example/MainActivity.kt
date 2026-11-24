@@ -174,6 +174,7 @@ private fun UnlockedDskLockerScaffold(viewModel: DskLockerViewModel) {
     val mediaPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 25)
     ) { uris ->
+        viewModel.clearExternalActivityLockSuppression()
         val ctx = uploadDialogContext
         uploadDialogContext = null
         if (uris.isNotEmpty()) {
@@ -190,6 +191,7 @@ private fun UnlockedDskLockerScaffold(viewModel: DskLockerViewModel) {
     val documentPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
+        viewModel.clearExternalActivityLockSuppression()
         val ctx = uploadDialogContext
         uploadDialogContext = null
         if (uris.isNotEmpty()) {
@@ -451,6 +453,7 @@ private fun UnlockedDskLockerScaffold(viewModel: DskLockerViewModel) {
                 Spacer(modifier = Modifier.height(14.dp))
                 Button(
                     onClick = {
+                        viewModel.suppressAutoLockForExternalActivity()
                         mediaPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
@@ -465,7 +468,10 @@ private fun UnlockedDskLockerScaffold(viewModel: DskLockerViewModel) {
                 }
                 Spacer(modifier = Modifier.height(10.dp))
                 OutlinedButton(
-                    onClick = { documentPicker.launch(arrayOf("*/*")) },
+                    onClick = {
+                        viewModel.suppressAutoLockForExternalActivity()
+                        documentPicker.launch(arrayOf("*/*"))
+                    },
                     border = BorderStroke(1.dp, NeonViolet),
                     modifier = Modifier
                         .fillMaxWidth()

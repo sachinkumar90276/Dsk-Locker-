@@ -20,6 +20,7 @@ import com.example.storage.LocalFileManager
 import com.google.firebase.auth.PhoneAuthProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -355,6 +356,11 @@ class DskLockerRepository(
 
     suspend fun saveNewMpin(mpin: String) {
         prefs.saveMpin(mpin)
+        syncStoredMpinToBackend(mpin.length)
+        logSecurity("MPIN_UPDATED", "Owner ${mpin.length}-digit PBKDF2 MPIN hash updated securely", true)
+    }
+
+    suspend fun syncStoredMpinToBackend(mpinLength: Int = prefs.getMpinLength()) {
         val (hash, salt) = prefs.getMpinHashForSync() ?: return
         val idToken = resolveIdToken()
         if (!idToken.isNullOrBlank() && isBackendConfiguredForClient()) {
@@ -362,11 +368,10 @@ class DskLockerRepository(
                 firebaseIdToken = idToken,
                 mpinHash = hash,
                 mpinSalt = salt,
-                mpinLength = mpin.length,
+                mpinLength = mpinLength,
                 biometricEnabled = prefs.biometricEnabled
             )
         }
-        logSecurity("MPIN_UPDATED", "Owner ${mpin.length}-digit PBKDF2 MPIN hash updated securely", true)
     }
 
     suspend fun verifyMpinWithBackendIfLinked(mpin: String, purpose: String = "RECOVERY"): Result<Unit> {
@@ -536,8 +541,8 @@ class DskLockerRepository(
         val token = resolveIdToken()
         when (mode) {
             DeleteMode.MOBILE_ONLY -> {
-                file.localPath?.let { path -> runCatching { File(path).delete() } }
                 if (!file.cloudPath.isNullOrBlank()) {
+                    file.localPath?.let { path -> runCatching { File(path).delete() } }
                     val cloudOnly = file.copy(
                         localPath = null,
                         backupStatus = BackupStatus.CLOUD_ONLY,
@@ -545,17 +550,17 @@ class DskLockerRepository(
                     )
                     db.fileItemDao().upsert(cloudOnly)
                     syncFileMetadata(cloudOnly)
+                    logSecurity("DELETE_MOBILE_ONLY", "Removed local copy of ${file.displayName}; Cloud backup untouched", true)
                 } else {
                     val trashed = file.copy(
-                        localPath = null,
                         isDeleted = true,
                         deletedAt = now,
                         updatedAt = now
                     )
                     db.fileItemDao().upsert(trashed)
                     syncFileMetadata(trashed)
+                    logSecurity("DELETE_TO_TRASH", "Moved unbacked-up file ${file.displayName} to Recycle Bin", true)
                 }
-                logSecurity("DELETE_MOBILE_ONLY", "Removed local copy of ${file.displayName}; Cloud backup untouched", true)
             }
 
             DeleteMode.CLOUD_ONLY -> {
@@ -615,6 +620,14 @@ class DskLockerRepository(
     }
 
     suspend fun emptyAllTrash() {
+        val trashedNotes = db.textNoteDao().observeTrashNotes().first()
+        val trashedLinks = db.savedLinkDao().observeTrashLinks().first()
+        for (note in trashedNotes) {
+            deleteRemoteRowIfAuthenticated("text_notes", note.id)
+        }
+        for (link in trashedLinks) {
+            deleteRemoteRowIfAuthenticated("saved_links", link.id)
+        }
         db.fileItemDao().emptyTrashFiles()
         db.textNoteDao().emptyTrashNotes()
         db.savedLinkDao().emptyTrashLinks()
@@ -773,11 +786,13 @@ class DskLockerRepository(
                     BackupExecutionSummary(0, 0, notice = "Cloud snapshot synced cleanly to Neon PostgreSQL.")
                 } else {
                     val err = snapRes.exceptionOrNull()
+                    val msg = err?.localizedMessage ?: "Snapshot backup failed."
+                    val isTransient = isTransientBackupError(err, msg)
                     BackupExecutionSummary(
                         0,
                         1,
-                        transientRetryNeeded = err is IOException,
-                        notice = err?.localizedMessage ?: "Snapshot backup failed."
+                        transientRetryNeeded = isTransient,
+                        notice = msg
                     )
                 }
             }
@@ -932,7 +947,7 @@ class DskLockerRepository(
                 val err = uploadRes.exceptionOrNull()
                 val msg = err?.localizedMessage ?: "Neon backup upload failed"
                 lastErrorMsg = msg
-                val isTransient = err is IOException || msg.contains("timeout", ignoreCase = true) || msg.contains("connect", ignoreCase = true)
+                val isTransient = isTransientBackupError(err, msg)
                 if (isTransient) {
                     transientNeedRetry = true
                     db.fileItemDao().upsert(item.copy(backupStatus = BackupStatus.BACKUP_PENDING))
@@ -965,6 +980,18 @@ class DskLockerRepository(
             transientRetryNeeded = transientNeedRetry,
             notice = combinedNotice
         )
+    }
+
+    private fun isTransientBackupError(err: Throwable?, msg: String): Boolean {
+        if (err is IOException || err is TransientBackendHttpException) return true
+        return msg.contains("timeout", ignoreCase = true) ||
+            msg.contains("connect", ignoreCase = true) ||
+            msg.contains("waking up", ignoreCase = true) ||
+            msg.contains("temporarily unavailable", ignoreCase = true) ||
+            msg.contains("502") ||
+            msg.contains("503") ||
+            msg.contains("504") ||
+            msg.contains("429")
     }
 
     suspend fun runManualBackup(filesToBackup: List<FileItemEntity>? = null): Pair<Int, Int> {

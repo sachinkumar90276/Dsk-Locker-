@@ -90,6 +90,7 @@ fun FilesExplorerScreen(
     val videoMediaPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 15)
     ) { uris ->
+        viewModel.clearExternalActivityLockSuppression()
         if (uris.isNotEmpty()) {
             viewModel.importFiles(
                 uris = uris,
@@ -104,6 +105,7 @@ fun FilesExplorerScreen(
     val videoDocPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
+        viewModel.clearExternalActivityLockSuppression()
         if (uris.isNotEmpty()) {
             viewModel.importFiles(
                 uris = uris,
@@ -346,6 +348,7 @@ fun FilesExplorerScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                             Button(
                                 onClick = {
+                                    viewModel.suppressAutoLockForExternalActivity()
                                     videoMediaPicker.launch(
                                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
                                     )
@@ -361,7 +364,10 @@ fun FilesExplorerScreen(
                                 Text("Upload Video", fontWeight = FontWeight.Bold)
                             }
                             OutlinedButton(
-                                onClick = { videoDocPicker.launch(arrayOf("video/*")) },
+                                onClick = {
+                                    viewModel.suppressAutoLockForExternalActivity()
+                                    videoDocPicker.launch(arrayOf("video/*"))
+                                },
                                 border = BorderStroke(1.dp, NeonViolet),
                                 modifier = Modifier
                                     .weight(1f)
@@ -930,9 +936,9 @@ fun SecureVaultScreen(
     val vaultFiles by viewModel.vaultFiles.collectAsState()
     val lockoutSeconds by viewModel.lockoutSeconds.collectAsState()
     val secretMpinConfigured by viewModel.secretMpinConfigured.collectAsState()
-    val bioEnabled = remember { viewModel.isBiometricEnabled() }
-    val bioAvail = remember { viewModel.biometricAvailability() }
-    val pinLen = remember { viewModel.loginMpinLength() }
+    val bioEnabled by viewModel.biometricEnabledState.collectAsState()
+    val bioAvail = remember(bioEnabled) { viewModel.biometricAvailability() }
+    val pinLen by viewModel.loginMpinLengthState.collectAsState()
 
     var pin by remember { mutableStateOf("") }
     var gateError by remember { mutableStateOf<String?>(null) }
@@ -977,12 +983,19 @@ fun SecureVaultScreen(
                 showBiometricButton = bioEnabled && bioAvail is BiometricAvailability.Available,
                 onBiometricClick = {
                     if (activity != null) {
+                        viewModel.suppressAutoLockForExternalActivity()
                         BiometricHelper.authenticate(
                             activity = activity,
                             title = "Unlock Secure Vault",
                             subtitle = "Verify fingerprint or face to decrypt private vault",
-                            onSuccess = { viewModel.unlockVaultWithBiometric() },
-                            onFailure = { gateError = it }
+                            onSuccess = {
+                                viewModel.clearExternalActivityLockSuppression()
+                                viewModel.unlockVaultWithBiometric()
+                            },
+                            onFailure = {
+                                viewModel.clearExternalActivityLockSuppression()
+                                gateError = it
+                            }
                         )
                     }
                 },

@@ -171,6 +171,11 @@ data class BackendHealthStatusDto(
     val httpCode: Int = 200
 )
 
+class TransientBackendHttpException(
+    val httpCode: Int,
+    message: String
+) : IOException(message)
+
 class SqlBackendClient(
     private val baseUrlProvider: () -> String = { BackendConfig.apiBaseUrl }
 ) {
@@ -201,21 +206,33 @@ class SqlBackendClient(
         return url
     }
 
+    private fun isTransientHttpCode(code: Int): Boolean =
+        code == 408 || code == 429 || code == 500 || code == 502 || code == 503 || code == 504
+
+    private fun throwHttpFailure(code: Int, body: String, fallback: String): Nothing {
+        val parsed = parseError(body, fallback)
+        if (isTransientHttpCode(code)) {
+            throw TransientBackendHttpException(code, parsed)
+        }
+        throw IllegalStateException(parsed)
+    }
+
     private fun executeWithColdStartRetry(requestBuilder: () -> Request): okhttp3.Response {
         var lastException: Exception? = null
-        for (attempt in 0..1) {
+        val retryDelaysMs = longArrayOf(1000L, 2000L)
+        for (attempt in 0..2) {
             try {
                 val resp = http.newCall(requestBuilder()).execute()
-                if (attempt == 0 && (resp.code == 502 || resp.code == 503 || resp.code == 504)) {
+                if (attempt < 2 && (resp.code == 429 || resp.code == 502 || resp.code == 503 || resp.code == 504)) {
                     resp.close()
-                    Thread.sleep(1500L)
+                    Thread.sleep(retryDelaysMs[attempt])
                     continue
                 }
                 return resp
-            } catch (e: java.io.IOException) {
+            } catch (e: IOException) {
                 lastException = e
-                if (attempt == 0) {
-                    Thread.sleep(1200L)
+                if (attempt < 2) {
+                    Thread.sleep(retryDelaysMs[attempt])
                 }
             }
         }
@@ -288,15 +305,16 @@ class SqlBackendClient(
             if (phoneE164.isNotBlank()) payload.put("phoneNumber", phoneE164)
             if (!ownerName.isNullOrBlank()) payload.put("ownerName", ownerName)
 
-            val req = Request.Builder()
-                .url("$url/api/auth/register-owner")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/auth/register-owner")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "Owner registration denied (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "Owner registration denied (${resp.code}).")
                 }
             }
         }
@@ -320,15 +338,16 @@ class SqlBackendClient(
                 .put("mpinLength", mpinLength)
             if (biometricEnabled != null) payload.put("biometricEnabled", biometricEnabled)
 
-            val req = Request.Builder()
-                .url("$url/api/security/mpin")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .put(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/security/mpin")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .put(payload.toString().toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "Security hash sync failed (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "Security hash sync failed (${resp.code}).")
                 }
             }
         }
@@ -344,16 +363,17 @@ class SqlBackendClient(
             val payload = JSONObject()
                 .put("mpin", mpin)
                 .put("purpose", purpose)
-            val req = Request.Builder()
-                .url("$url/api/security/mpin/verify")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/security/mpin/verify")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(str, "MPIN verification denied (${resp.code})."))
+                    throwHttpFailure(resp.code, str, "MPIN verification denied (${resp.code}).")
                 }
             }
         }
@@ -372,16 +392,17 @@ class SqlBackendClient(
                 .put("vaultKeyBase64", vaultKeyBase64)
                 .put("keyVersion", keyVersion)
             if (!mpin.isNullOrBlank()) payload.put("mpin", mpin)
-            val req = Request.Builder()
-                .url("$url/api/security/recovery-key")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/security/recovery-key")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(str, "Failed to wrap recovery key (${resp.code})."))
+                    throwHttpFailure(resp.code, str, "Failed to wrap recovery key (${resp.code}).")
                 }
             }
         }
@@ -395,16 +416,17 @@ class SqlBackendClient(
             val url = requireConfiguredUrl()
             val payload = JSONObject().put("action", "recover")
             if (!mpin.isNullOrBlank()) payload.put("mpin", mpin)
-            val req = Request.Builder()
-                .url("$url/api/security/recovery-key")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/security/recovery-key")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(str, "Encryption key recovery failed (${resp.code})."))
+                    throwHttpFailure(resp.code, str, "Encryption key recovery failed (${resp.code}).")
                 }
                 val json = JSONObject(str)
                 json.getString("vaultKeyBase64")
@@ -468,16 +490,18 @@ class SqlBackendClient(
                 )
             }
 
-            val req = Request.Builder()
-                .url("$url/api/backup/create")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(root.toString().toRequestBody(jsonMedia))
-                .build()
-            executeWithColdStartRetry { req }.use { resp ->
+            val jsonPayload = root.toString()
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/backup/create")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(jsonPayload.toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 val bodyStr = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(bodyStr, "Cloud backup upload failed (${resp.code})."))
+                    throwHttpFailure(resp.code, bodyStr, "Cloud backup upload failed (${resp.code}).")
                 }
                 val json = JSONObject(bodyStr)
                 CloudBackupCreateResultDto(
@@ -618,15 +642,16 @@ class SqlBackendClient(
         runCatching {
             val url = requireConfiguredUrl()
             destFile.parentFile?.mkdirs()
-            val req = Request.Builder()
-                .url("$url/api/backup/files/${URLEncoder.encode(fileId, "UTF-8")}/content")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .get()
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/backup/files/${URLEncoder.encode(fileId, "UTF-8")}/content")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .get()
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
                     val str = resp.body?.string().orEmpty()
-                    throw IllegalStateException(parseError(str, "Failed to download backed-up file (${resp.code})."))
+                    throwHttpFailure(resp.code, str, "Failed to download backed-up file (${resp.code}).")
                 }
                 val body = resp.body ?: throw IllegalStateException("Empty download response.")
                 val total = body.contentLength().coerceAtLeast(1L)
@@ -660,14 +685,15 @@ class SqlBackendClient(
         val url = resolvedBaseUrl()
         if (url.isBlank() || firebaseIdToken.isBlank()) return@withContext Result.success(Unit)
         runCatching {
-            val req = Request.Builder()
-                .url("$url/api/backup/files/${URLEncoder.encode(fileId, "UTF-8")}")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .delete()
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/backup/files/${URLEncoder.encode(fileId, "UTF-8")}")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .delete()
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "Cloud delete failed (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "Cloud delete failed (${resp.code}).")
                 }
             }
         }
@@ -684,16 +710,18 @@ class SqlBackendClient(
             if (!fileIds.isNullOrEmpty()) {
                 payload.put("fileIds", JSONArray().apply { fileIds.forEach { put(it) } })
             }
-            val req = Request.Builder()
-                .url("$url/api/backup/restore")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            val bodyStr = payload.toString()
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/backup/restore")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(bodyStr.toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(str, "Restore start failed (${resp.code})."))
+                    throwHttpFailure(resp.code, str, "Restore start failed (${resp.code}).")
                 }
                 val json = JSONObject(str)
                 CloudRestoreManifestDto(
@@ -729,15 +757,17 @@ class SqlBackendClient(
                 .put("failedFiles", failedFiles)
                 .put("bytesRestored", bytesRestored)
                 .put("message", message)
-            val req = Request.Builder()
-                .url("$url/api/backup/restore/complete")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            val bodyStr = payload.toString()
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/backup/restore/complete")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(bodyStr.toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "Restore completion sync failed (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "Restore completion sync failed (${resp.code}).")
                 }
             }
         }
@@ -756,15 +786,17 @@ class SqlBackendClient(
                 .put("backupPhotos", settings.backupPhotos)
                 .put("backupVideos", settings.backupVideos)
                 .put("backupDocuments", settings.backupDocuments)
-            val req = Request.Builder()
-                .url("$url/api/backup/settings")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .put(payload.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            val bodyStr = payload.toString()
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/backup/settings")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .put(bodyStr.toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "Backup settings update failed (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "Backup settings update failed (${resp.code}).")
                 }
             }
         }
@@ -780,15 +812,17 @@ class SqlBackendClient(
             return@withContext Result.success(Unit)
         }
         runCatching {
-            val req = Request.Builder()
-                .url("$url/api/sync/$table")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .addHeader("Content-Type", "application/json")
-                .post(rowJson.toString().toRequestBody(jsonMedia))
-                .build()
-            http.newCall(req).execute().use { resp ->
+            val bodyStr = rowJson.toString()
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/sync/$table")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .addHeader("Content-Type", "application/json")
+                    .post(bodyStr.toRequestBody(jsonMedia))
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "SQL sync $table failed (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "SQL sync $table failed (${resp.code}).")
                 }
             }
         }
@@ -804,14 +838,15 @@ class SqlBackendClient(
             return@withContext Result.success(Unit)
         }
         runCatching {
-            val req = Request.Builder()
-                .url("$url/api/sync/$table/${URLEncoder.encode(recordId, "UTF-8")}")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .delete()
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/sync/$table/${URLEncoder.encode(recordId, "UTF-8")}")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .delete()
+                    .build()
+            }.use { resp ->
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(resp.body?.string().orEmpty(), "SQL delete $table failed (${resp.code})."))
+                    throwHttpFailure(resp.code, resp.body?.string().orEmpty(), "SQL delete $table failed (${resp.code}).")
                 }
             }
         }
@@ -823,15 +858,16 @@ class SqlBackendClient(
             return@withContext Result.success(JSONArray())
         }
         runCatching {
-            val req = Request.Builder()
-                .url("$url/api/files")
-                .addHeader("Authorization", "Bearer $firebaseIdToken")
-                .get()
-                .build()
-            http.newCall(req).execute().use { resp ->
+            executeWithColdStartRetry {
+                Request.Builder()
+                    .url("$url/api/files")
+                    .addHeader("Authorization", "Bearer $firebaseIdToken")
+                    .get()
+                    .build()
+            }.use { resp ->
                 val str = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException(parseError(str, "Fetch SQL files failed (${resp.code})."))
+                    throwHttpFailure(resp.code, str, "Fetch SQL files failed (${resp.code}).")
                 }
                 JSONArray(str.ifBlank { "[]" })
             }
