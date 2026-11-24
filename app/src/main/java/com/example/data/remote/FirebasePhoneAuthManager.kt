@@ -127,15 +127,44 @@ data class FirebaseSessionUser(
     val isEmailVerified: Boolean = false
 )
 
-class FirebasePhoneAuthManager {
+class FirebasePhoneAuthManager(
+    private val appContext: Context? = null
+) {
     private val auth: FirebaseAuth
         get() = Firebase.auth
 
-    private fun isFirebaseReady(): Boolean =
-        runCatching { FirebaseApp.getInstance(); true }.getOrDefault(false)
+    private fun ensureFirebaseInitialized(ctx: Context? = appContext): Boolean {
+        if (runCatching { FirebaseApp.getInstance(); true }.getOrDefault(false)) {
+            return true
+        }
+        val c = ctx?.applicationContext ?: ctx ?: return false
+        return runCatching {
+            if (FirebaseApp.getApps(c).isEmpty()) {
+                FirebaseApp.initializeApp(c)
+            }
+            FirebaseApp.getApps(c).isNotEmpty() || runCatching {
+                FirebaseApp.getInstance()
+                true
+            }.getOrDefault(false)
+        }.getOrDefault(false)
+    }
+
+    private fun hasGoogleAppIdResource(ctx: Context? = appContext): Boolean {
+        val c = ctx ?: return false
+        val resId = c.resources.getIdentifier("google_app_id", "string", c.packageName)
+        if (resId == 0) return false
+        return runCatching { c.getString(resId).isNotBlank() }.getOrDefault(false)
+    }
+
+    private fun uninitializedFirebaseError(ctx: Context? = appContext): String =
+        if (ctx != null && !hasGoogleAppIdResource(ctx)) {
+            "Firebase is not configured in this APK build (app/google-services.json missing). Add app/google-services.json or GitHub Secret GOOGLE_SERVICES_JSON and rebuild."
+        } else {
+            "Firebase is not initialized in this build. Verify google-services.json configuration."
+        }
 
     fun currentUser(): com.google.firebase.auth.FirebaseUser? =
-        if (!isFirebaseReady()) null else runCatching { auth.currentUser }.getOrNull()
+        if (!ensureFirebaseInitialized()) null else runCatching { auth.currentUser }.getOrNull()
 
     suspend fun getFreshIdToken(forceRefresh: Boolean = false): String? {
         val user = currentUser() ?: return null
@@ -161,7 +190,7 @@ class FirebasePhoneAuthManager {
     }
 
     suspend fun attemptSilentGoogleSignIn(context: Context): FirebaseSessionUser? {
-        if (!isFirebaseReady()) return null
+        if (!ensureFirebaseInitialized(context)) return null
         currentUser()?.let { existing ->
             val token = runCatching { existing.getIdToken(false).await()?.token }.getOrNull()
             if (!token.isNullOrBlank()) {
@@ -218,8 +247,8 @@ class FirebasePhoneAuthManager {
     }
 
     suspend fun signInWithGoogle(context: Context): GoogleSignInResult {
-        if (!isFirebaseReady()) {
-            return GoogleSignInResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration.")
+        if (!ensureFirebaseInitialized(context)) {
+            return GoogleSignInResult.Error(uninitializedFirebaseError(context))
         }
         val clientId = try {
             context.getString(R.string.default_web_client_id)
@@ -285,8 +314,8 @@ class FirebasePhoneAuthManager {
         resendToken: PhoneAuthProvider.ForceResendingToken? = null,
         onResult: (PhoneOtpStartResult) -> Unit
     ) {
-        if (!isFirebaseReady()) {
-            onResult(PhoneOtpStartResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration."))
+        if (!ensureFirebaseInitialized(activity)) {
+            onResult(PhoneOtpStartResult.Error(uninitializedFirebaseError(activity)))
             return
         }
         val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
@@ -349,7 +378,7 @@ class FirebasePhoneAuthManager {
         smsCode: String,
         expectedPhoneE164: String
     ): Result<FirebaseSessionUser> = runCatching {
-        check(isFirebaseReady()) { "Firebase is not initialized in this build." }
+        check(ensureFirebaseInitialized()) { uninitializedFirebaseError() }
         val credential = PhoneAuthProvider.getCredential(verificationId, smsCode)
         val authResult = auth.signInWithCredential(credential).await()
         val user = authResult.user ?: throw IllegalStateException("Firebase Phone authentication returned null user.")
@@ -371,8 +400,8 @@ class FirebasePhoneAuthManager {
         password: String,
         displayName: String? = null
     ): EmailAuthResult {
-        if (!isFirebaseReady()) {
-            return EmailAuthResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration.")
+        if (!ensureFirebaseInitialized()) {
+            return EmailAuthResult.Error(uninitializedFirebaseError())
         }
         val cleanEmail = email.trim()
         if (!AuthValidation.isValidEmail(cleanEmail)) {
@@ -424,8 +453,8 @@ class FirebasePhoneAuthManager {
         email: String,
         password: String
     ): EmailAuthResult {
-        if (!isFirebaseReady()) {
-            return EmailAuthResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration.")
+        if (!ensureFirebaseInitialized()) {
+            return EmailAuthResult.Error(uninitializedFirebaseError())
         }
         val cleanEmail = email.trim()
         if (!AuthValidation.isValidEmail(cleanEmail)) {
@@ -461,8 +490,8 @@ class FirebasePhoneAuthManager {
     }
 
     suspend fun sendPasswordResetEmail(email: String): Result<Unit> {
-        if (!isFirebaseReady()) {
-            return Result.failure(IllegalStateException("Firebase is not initialized in this build."))
+        if (!ensureFirebaseInitialized()) {
+            return Result.failure(IllegalStateException(uninitializedFirebaseError()))
         }
         val cleanEmail = email.trim()
         if (!AuthValidation.isValidEmail(cleanEmail)) {

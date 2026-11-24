@@ -20,12 +20,30 @@ object DeterministicDocumentParser {
         "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka", "Kerala",
         "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland",
         "Odisha", "Orissa", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana",
-        "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal", "Delhi", "New Delhi",
-        "Chandigarh", "Puducherry", "Jammu and Kashmir", "Jammu & Kashmir", "Ladakh",
-        "Lakshadweep", "Dadra and Nagar Haveli", "Daman and Diu", "Andaman and Nicobar",
-        "उत्तर प्रदेश", "मध्य प्रदेश", "बिहार", "राजस्थान", "महाराष्ट्र", "गुजरात", "हरियाणा",
-        "पंजाब", "उत्तराखंड", "झारखंड", "छत्तीसगढ़", "दिल्ली", "नई दिल्ली", "पश्चिम बंगाल"
+        "Tripura", "Uttar Pradesh", "Uttarakhand", "Uttaranchal", "West Bengal",
+        "Delhi", "New Delhi", "NCT of Delhi", "Chandigarh", "Puducherry", "Pondicherry",
+        "Jammu and Kashmir", "Jammu & Kashmir", "Ladakh", "Lakshadweep",
+        "Dadra and Nagar Haveli and Daman and Diu", "Dadra and Nagar Haveli", "Daman and Diu",
+        "Andaman and Nicobar Islands", "Andaman & Nicobar Islands", "Andaman and Nicobar",
+        "आंध्र प्रदेश", "अरुणाचल प्रदेश", "असम", "बिहार", "छत्तीसगढ़", "गोवा",
+        "गुजरात", "हरियाणा", "हिमाचल प्रदेश", "झारखंड", "झारखण्ड", "कर्नाटक", "केरल",
+        "मध्य प्रदेश", "महाराष्ट्र", "मणिपुर", "मेघालय", "मिजोरम", "नागालैंड",
+        "ओडिशा", "उड़ीसा", "पंजाब", "राजस्थान", "सिक्किम", "तमिलनाडु", "तेलंगाना",
+        "त्रिपुरा", "उत्तर प्रदेश", "उत्तराखंड", "उत्तराखण्ड", "पश्चिम बंगाल",
+        "दिल्ली", "नई दिल्ली", "चंडीगढ़", "पुदुचेरी", "लद्दाख",
+        "जम्मू और कश्मीर", "जम्मू एवं कश्मीर", "लक्षद्वीप",
+        "अंडमान और निकोबार", "दादरा और नगर हवेली", "दमन और दीव"
     )
+
+    private val ocrStateAndCountryVariants = setOf(
+        "india", "bharat", "republic of india", "hindustan",
+        "भारत", "भारत गणराज्य", "हिन्दुस्तान",
+        "tamilnadu", "maharastra", "utter pradesh", "chattisgarh", "chatisgarh",
+        "u.p.", "m.p.", "a.p.", "h.p.", "t.n.", "w.b.", "j&k", "bengal",
+        "union territory", "national capital territory of delhi"
+    )
+
+    private val multiWordStatesAndUts = indianStatesAndUts.filter { it.contains(' ') }
 
     private val noiseHeadingRegex = Regex(
         """(?i)^(government of india|govt\.? of india|govt\.? of .*|government of .*|भारत सरकार|.* शासन|unique identification authority.*|income tax department.*|आयकर विभाग.*|permanent account number.*|स्थायी लेखा संख्या.*|election commission.*|भारत निर्वाचन आयोग.*|driving licence.*|indian union.*|republic of india|aadhaar|आधार|मेरा आधार|पहचान|निवास प्रमाण.*|मूल निवास प्रमाण.*|जाति प्रमाण.*|आय प्रमाण.*|जन्म प्रमाण.*|मृत्यु प्रमाण.*|विवाह प्रमाण.*|residence certificate|domicile certificate|caste certificate|income certificate|birth certificate|to whomsoever it may concern)$"""
@@ -40,6 +58,14 @@ object DeterministicDocumentParser {
         "institute", "limited", "pvt", "private", "corporation", "municipal",
         "तहसीलदार", "नायब तहसीलदार", "उपजिलाधिकारी", "जिलाधिकारी", "सक्षम अधिकारी",
         "अधिकारी", "हस्ताक्षर", "विभाग", "सरकार", "शासन", "मंत्रालय", "प्राधिकरण"
+    )
+
+    private val nonHolderLocationWordRegex = Regex(
+        """(?i)$BOUNDARY_START(?:state|district|dist|tehsil|tahsil|taluk|taluka|village|gram|city|town|country|address|pincode|pin\s*code|domicile|residence|resident|राज्य|प्रदेश|जिला|जनपद|तहसील|ग्राम|गांव|शहर|देश|पता|निवास|निवासी)$BOUNDARY_END"""
+    )
+
+    private val nonHolderAddressCueRegex = Regex(
+        """(?i)\b(?:road|street|lane|marg|colony|sector|vihar|enclave|mohalla|post\s+office|p\.?o\.?|house\s+no|flat\s+no|plot\s+no)\b"""
     )
 
     private val hindiMonthMap = mapOf(
@@ -142,6 +168,11 @@ object DeterministicDocumentParser {
 
         val pinCode = extractPinCode(normalizedDigitRaw)
         val state = extractIndianState(cleanRaw)
+            ?: extractLabelledValue(
+                lines,
+                listOf("State Name", "State of Residence", "State / UT", "State", "राज्य का नाम", "राज्य", "प्रदेश"),
+                stopAtComma = true
+            )?.let(::truncateAtInlineLabel)?.trim()?.takeIf { it.isNotBlank() && it.length <= 40 }
         var district = extractLabelledValue(lines, listOf("District", "Dist", "Dist.", "जिला", "जनपद"), stopAtComma = true)
             ?: extractNarrativeLocationToken(cleanRaw, listOf("जिला", "जनपद", "District", "Dist"))
         var tehsil = extractLabelledValue(lines, listOf("Tehsil", "Tahsil", "Taluka", "Taluk", "Block", "Sub-Division", "तहसील", "तालुका", "प्रखण्ड", "उपखंड"), stopAtComma = true)
@@ -329,6 +360,14 @@ object DeterministicDocumentParser {
             }
         }
 
+        // Parse address subcomponents BEFORE holder validation so address locations are never mistaken for holder name
+        if (address != null) {
+            if (district == null) district = extractTokenAfter(address, listOf("Dist", "District", "जिला", "जनपद"))
+            if (tehsil == null) tehsil = extractTokenAfter(address, listOf("Tehsil", "Tahsil", "Taluka", "Block", "तहसील", "प्रखण्ड"))
+            if (village == null) village = extractTokenAfter(address, listOf("Village", "Vill", "VTC", "Gram", "ग्राम", "गांव"))
+            if (city == null && district != null) city = inferCityFromAddress(address, district, tehsil, state, pinCode)
+        }
+
         // Strict Holder / Owner Name extraction (Explicit label -> Narrative clause -> Strict DOB anchor, never guessing)
         val holderResult = extractValidatedHolderName(
             lines = lines,
@@ -340,7 +379,13 @@ object DeterministicDocumentParser {
             orgName = orgName,
             issuingAuth = issuingAuth,
             detectedName = detectedName,
-            originalFilename = originalFilename
+            originalFilename = originalFilename,
+            state = state,
+            district = district,
+            city = city,
+            village = village,
+            tehsil = tehsil,
+            address = address
         )
         val ownerName = holderResult?.first
         val ownerConfidence = holderResult?.second ?: 0
@@ -354,14 +399,6 @@ object DeterministicDocumentParser {
         // Infer PAN Father name if PAN structural anchor placed owner directly before father
         if (detectedType == "PAN Card" && fatherName == null && finalOwnerName != null) {
             fatherName = inferPanFatherAfterOwner(lines, finalOwnerName, dateOfBirth)
-        }
-
-        // Parse address subcomponents from address string or narrative text
-        if (address != null) {
-            if (district == null) district = extractTokenAfter(address, listOf("Dist", "District", "जिला", "जनपद"))
-            if (tehsil == null) tehsil = extractTokenAfter(address, listOf("Tehsil", "Tahsil", "Taluka", "Block", "तहसील", "प्रखण्ड"))
-            if (village == null) village = extractTokenAfter(address, listOf("Village", "Vill", "VTC", "Gram", "ग्राम", "गांव"))
-            if (city == null && district != null) city = inferCityFromAddress(address, district, tehsil, state, pinCode)
         }
 
         if (docNumber == null && regNumber != null && detectedType !in setOf("Residence Certificate", "Caste Certificate", "Income Certificate")) {
@@ -589,6 +626,12 @@ object DeterministicDocumentParser {
         val verifiedSpouse = pickGrounded(DocumentFieldProfile.KEY_SPOUSE_NAME, ai.spouseName, localFallback.spouseName)
         val verifiedOrg = pickGrounded(DocumentFieldProfile.KEY_ORG_NAME, ai.organizationName, localFallback.organizationName)
         val verifiedAuth = pickGrounded(DocumentFieldProfile.KEY_ISSUING_AUTH, ai.issuingAuthority, localFallback.issuingAuthority)
+        val verifiedAddress = pickGrounded(DocumentFieldProfile.KEY_ADDRESS, ai.address, localFallback.address)
+        val verifiedVillage = pickGrounded(DocumentFieldProfile.KEY_VILLAGE, ai.village, localFallback.village)
+        val verifiedTehsil = pickGrounded(DocumentFieldProfile.KEY_TEHSIL, ai.tehsil, localFallback.tehsil)
+        val verifiedCity = pickGrounded(DocumentFieldProfile.KEY_CITY, ai.city, localFallback.city)
+        val verifiedDistrict = pickGrounded(DocumentFieldProfile.KEY_DISTRICT, ai.district, localFallback.district)
+        val verifiedState = pickGrounded(DocumentFieldProfile.KEY_STATE, ai.state, localFallback.state)
 
         val verifiedOwner = pickGrounded(
             key = DocumentFieldProfile.KEY_OWNER_NAME,
@@ -603,7 +646,13 @@ object DeterministicDocumentParser {
                 orgName = verifiedOrg,
                 issuingAuth = verifiedAuth,
                 docName = resolvedName,
-                originalFilename = originalFilename
+                originalFilename = originalFilename,
+                state = verifiedState,
+                district = verifiedDistrict,
+                city = verifiedCity,
+                village = verifiedVillage,
+                tehsil = verifiedTehsil,
+                address = verifiedAddress
             )
         }
 
@@ -620,12 +669,12 @@ object DeterministicDocumentParser {
             registrationNumber = pickGrounded(DocumentFieldProfile.KEY_REG_NUMBER, ai.registrationNumber?.let(::normalizeIndicDigits), localFallback.registrationNumber),
             mobileNumber = pickGrounded(DocumentFieldProfile.KEY_MOBILE, ai.mobileNumber?.let(::normalizeIndicDigits), localFallback.mobileNumber),
             email = pickGrounded(DocumentFieldProfile.KEY_EMAIL, ai.email, localFallback.email) { it.contains("@") },
-            address = pickGrounded(DocumentFieldProfile.KEY_ADDRESS, ai.address, localFallback.address),
-            village = pickGrounded(DocumentFieldProfile.KEY_VILLAGE, ai.village, localFallback.village),
-            tehsil = pickGrounded(DocumentFieldProfile.KEY_TEHSIL, ai.tehsil, localFallback.tehsil),
-            city = pickGrounded(DocumentFieldProfile.KEY_CITY, ai.city, localFallback.city),
-            district = pickGrounded(DocumentFieldProfile.KEY_DISTRICT, ai.district, localFallback.district),
-            state = pickGrounded(DocumentFieldProfile.KEY_STATE, ai.state, localFallback.state),
+            address = verifiedAddress,
+            village = verifiedVillage,
+            tehsil = verifiedTehsil,
+            city = verifiedCity,
+            district = verifiedDistrict,
+            state = verifiedState,
             pinCode = pickGrounded(DocumentFieldProfile.KEY_PIN_CODE, ai.pinCode?.let(::normalizeIndicDigits), localFallback.pinCode) { it.matches(Regex("""[1-9]\d{5}""")) },
             organizationName = verifiedOrg,
             issueDate = pickGrounded(DocumentFieldProfile.KEY_ISSUE_DATE, normalizeDateOrKeep(ai.issueDate), localFallback.issueDate, isDate = true),
@@ -705,25 +754,52 @@ object DeterministicDocumentParser {
         orgName: String?,
         issuingAuth: String?,
         detectedName: String?,
-        originalFilename: String
+        originalFilename: String,
+        state: String? = null,
+        district: String? = null,
+        city: String? = null,
+        village: String? = null,
+        tehsil: String? = null,
+        address: String? = null
     ): Pair<String, Int>? {
         // Tier 1: Explicit Holder / Applicant Labels (highest confidence)
         val holderLabels = listOf(
-            "Applicant Name", "Applicant's Name", "Certificate Holder", "Beneficiary Name",
-            "Holder Name", "Card Holder", "Cardholder Name", "Cardholder",
-            "Account Holder", "Policyholder", "Student Name", "Candidate Name",
+            "Applicant Name", "Applicant's Name", "Name of Applicant",
+            "Certificate Holder Name", "Certificate Holder",
+            "Beneficiary Name", "Name of Beneficiary",
+            "Holder Name", "Name of Holder",
+            "Card Holder Name", "Card Holder", "Cardholder Name", "Name of Cardholder", "Cardholder",
+            "Owner Name", "Owner's Name", "Name of Owner",
+            "Account Holder Name", "Account Holder", "Name of Account Holder",
+            "Policyholder Name", "Policyholder", "Student Name", "Candidate Name",
             "Employee Name", "Patient Name", "Customer Name", "Issued To",
-            "आवेदक का नाम", "नाम धारक", "लाभार्थी का नाम", "प्रमाणित व्यक्ति", "धारक का नाम",
+            "आवेदक का नाम", "धारक का नाम", "कार्डधारक का नाम", "खाताधारक का नाम",
+            "मालिक का नाम", "स्वामी का नाम", "नाम धारक", "लाभार्थी का नाम", "प्रमाणित व्यक्ति",
             "Name", "नाम"
         )
         for (label in holderLabels) {
-            val found = extractSafeNameForLabel(lines, label)
-            val cleaned = cleanPersonName(found)
-            if (cleaned != null && isValidHolderCandidate(
-                    cleaned, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename
-                )
-            ) {
-                return cleaned to 96
+            val candidates = extractSafeNamesForLabel(lines, label)
+            for (found in candidates) {
+                val cleaned = cleanPersonName(found)
+                if (cleaned != null && isValidHolderCandidate(
+                        candidate = cleaned,
+                        fatherName = fatherName,
+                        motherName = motherName,
+                        spouseName = spouseName,
+                        orgName = orgName,
+                        issuingAuth = issuingAuth,
+                        docName = detectedName,
+                        originalFilename = originalFilename,
+                        state = state,
+                        district = district,
+                        city = city,
+                        village = village,
+                        tehsil = tehsil,
+                        address = address
+                    )
+                ) {
+                    return cleaned to 96
+                }
             }
         }
 
@@ -732,7 +808,20 @@ object DeterministicDocumentParser {
             """(?:यह\s+)?प्रमाणित\s+किया\s+जाता\s+है\s+कि\s+(?:श्री|श्रीमती|सुश्री|कुमारी|कु\.?)?\s*([A-Za-z\u0900-\u097F.\s]{2,55}?)(?=\s+(?:पुत्र|पुत्री|पत्नी|पत्नि|आत्मज|आत्मजा|निवासी|उर्फ|आयु|वर्ष|S/O|D/O|W/O|C/O)|,|$|\n)"""
         ).find(cleanRaw)?.groupValues?.getOrNull(1)?.let(::cleanPersonName)
         if (hindiClause != null && isValidHolderCandidate(
-                hindiClause, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename
+                candidate = hindiClause,
+                fatherName = fatherName,
+                motherName = motherName,
+                spouseName = spouseName,
+                orgName = orgName,
+                issuingAuth = issuingAuth,
+                docName = detectedName,
+                originalFilename = originalFilename,
+                state = state,
+                district = district,
+                city = city,
+                village = village,
+                tehsil = tehsil,
+                address = address
             )
         ) {
             return hindiClause to 91
@@ -742,7 +831,20 @@ object DeterministicDocumentParser {
             """(?i)(?:this\s+is\s+to\s+certify\s+that|certified\s+that)\s+(?:Shri|Smt\.?|Km\.?|Kumari|Mr\.?|Mrs\.?|Ms\.?)?\s*([A-Za-z.\s]{2,55}?)(?=\s+(?:S/O|D/O|W/O|C/O|R/O|son\s+of|daughter\s+of|wife\s+of|resident\s+of)|,|$|\n)"""
         ).find(cleanRaw)?.groupValues?.getOrNull(1)?.let(::cleanPersonName)
         if (englishClause != null && isValidHolderCandidate(
-                englishClause, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename
+                candidate = englishClause,
+                fatherName = fatherName,
+                motherName = motherName,
+                spouseName = spouseName,
+                orgName = orgName,
+                issuingAuth = issuingAuth,
+                docName = detectedName,
+                originalFilename = originalFilename,
+                state = state,
+                district = district,
+                city = city,
+                village = village,
+                tehsil = tehsil,
+                address = address
             )
         ) {
             return englishClause to 91
@@ -759,7 +861,13 @@ object DeterministicDocumentParser {
                 orgName = orgName,
                 issuingAuth = issuingAuth,
                 detectedName = detectedName,
-                originalFilename = originalFilename
+                originalFilename = originalFilename,
+                state = state,
+                district = district,
+                city = city,
+                village = village,
+                tehsil = tehsil,
+                address = address
             )
             if (structural != null) return structural to 82
         }
@@ -769,30 +877,96 @@ object DeterministicDocumentParser {
     }
 
     /**
-     * Prevents "Name" from accidentally matching "Father's Name", "Mother Name", "Officer Name", "Village Name", etc.
+     * Prevents "Name" / "नाम" from matching "State Name", "Father's Name", "District Name", etc.,
+     * isolates multi-column horizontal rows, and collects all candidate values in reading order.
      */
-    private fun extractSafeNameForLabel(lines: List<String>, label: String): String? {
+    private fun extractSafeNamesForLabel(lines: List<String>, label: String): List<String> {
         val disallowedPrefixes = listOf(
             "father", "mother", "husband", "wife", "spouse", "guardian", "parent",
             "bank", "company", "organization", "organisation", "institution", "school",
             "college", "university", "department", "village", "district", "tehsil",
+            "state", "residence", "domicile", "country", "nation", "city", "town",
+            "ward", "taluk", "taluka", "block", "sub-division", "subdivision",
+            "zone", "region", "circle", "division", "constituency", "panchayat",
+            "municipality", "address", "postal", "pin", "pincode", "zip", "place", "location",
+            "document", "certificate", "form", "scheme", "branch", "issuing", "signing",
+            "hospital", "clinic", "product", "plan", "course", "exam", "subject",
+            "dealer", "seller", "buyer", "witness",
             "officer", "authority", "nominee", "vendor", "employer", "shop", "store",
-            "पिता", "माता", "पति", "पत्नी", "ग्राम", "गांव", "जिला", "तहसील", "संस्था", "विभाग", "अधिकारी", "कार्यालय"
+            "पिता", "माता", "पति", "पत्नी", "ग्राम", "गांव", "जिला", "जनपद", "तहसील",
+            "राज्य", "प्रदेश", "देश", "शहर", "नगर", "कस्बा", "पता", "निवास", "निवासी",
+            "वार्ड", "ब्लॉक", "प्रखण्ड", "तालुका", "पिन", "डाक", "दस्तावेज़", "प्रमाण",
+            "प्रमाणपत्र", "अभिभावक", "संरक्षक", "शाखा", "योजना", "प्रदानकर्ता",
+            "संस्था", "विभाग", "अधिकारी", "कार्यालय"
         )
-        val regex = Regex("""(?i)$BOUNDARY_START${Regex.escape(label)}$BOUNDARY_END\s*[:\-–]\s*(.+)$""")
+        val isGenericNameLabel = label.equals("Name", ignoreCase = true) || label == "नाम"
+        val sameLineRegex = Regex("""(?i)$BOUNDARY_START${Regex.escape(label)}$BOUNDARY_END\s*[:\-–]\s*(.+)$""")
+        val emptyLineWithColonRegex = Regex("""(?i)$BOUNDARY_START${Regex.escape(label)}$BOUNDARY_END\s*[:\-–]\s*$""")
+        val standaloneExplicitRegex = Regex("""(?i)^${Regex.escape(label)}\s*$""")
+
+        val results = mutableListOf<String>()
         for (i in lines.indices) {
             val line = lines[i]
-            val m = regex.find(line) ?: continue
-            val beforeLabel = line.substring(0, m.range.first).lowercase()
-            if ((label.equals("Name", true) || label == "नाम") && disallowedPrefixes.any { beforeLabel.contains(it) }) {
-                continue
+            val m = sameLineRegex.find(line)
+            if (m != null) {
+                val localPrefix = immediatePrefixBeforeMatch(line, m.range.first)
+                if (isGenericNameLabel && disallowedPrefixes.any { hasPrefixKeyword(localPrefix, it) }) {
+                    continue
+                }
+                val truncated = truncateAtInlineLabel(m.groupValues[1])
+                val valRaw = truncated.trim().trim(':', '-', '–', '|', ',', ' ')
+                if (valRaw.isNotBlank() && !looksLikeAnotherLabel(valRaw)) {
+                    results.add(valRaw)
+                    continue
+                }
             }
-            val valRaw = m.groupValues[1].trim().trim(':', '-', ' ')
-            if (valRaw.isNotBlank() && !looksLikeAnotherLabel(valRaw)) {
-                return valRaw
+
+            // Next-line value fallback when "Label:" (or standalone multi-word explicit label) sits on its own line
+            val emptyColonMatch = emptyLineWithColonRegex.find(line)
+            val standaloneMatch = if (!isGenericNameLabel) standaloneExplicitRegex.find(line) else null
+            val boundaryMatch = emptyColonMatch ?: standaloneMatch
+            if (boundaryMatch != null && i + 1 < lines.size) {
+                val localPrefix = immediatePrefixBeforeMatch(line, boundaryMatch.range.first)
+                if (isGenericNameLabel && disallowedPrefixes.any { hasPrefixKeyword(localPrefix, it) }) {
+                    continue
+                }
+                val nextLine = truncateAtInlineLabel(lines[i + 1]).trim().trim(':', '-', '–', '|', ',', ' ')
+                if (nextLine.isNotBlank() && !looksLikeAnotherLabel(nextLine) && !noiseHeadingRegex.matches(nextLine)) {
+                    results.add(nextLine)
+                }
             }
         }
-        return null
+        return results
+    }
+
+    private fun immediatePrefixBeforeMatch(line: String, matchStart: Int): String {
+        val before = line.substring(0, matchStart)
+        return before
+            .substringAfterLast(':')
+            .substringAfterLast(';')
+            .substringAfterLast('|')
+            .split(Regex("""\s{2,}"""))
+            .lastOrNull()
+            .orEmpty()
+            .lowercase()
+    }
+
+    private fun hasPrefixKeyword(localPrefix: String, keyword: String): Boolean {
+        if (localPrefix.isBlank()) return false
+        return Regex("""(?i)$BOUNDARY_START${Regex.escape(keyword)}$BOUNDARY_END""").containsMatchIn(localPrefix)
+    }
+
+    private fun truncateAtInlineLabel(raw: String): String {
+        val pipeCut = raw.split(Regex("""\s*\|\s*"""), limit = 2).first()
+        val multiSpaceLabelCut = pipeCut.split(
+            Regex("""\s{2,}(?=[A-Za-z\u0900-\u097F'()./\s]{2,32}[:\-–])"""),
+            limit = 2
+        ).first()
+        val inlineFieldCut = multiSpaceLabelCut.split(
+            Regex("""(?i)\s+(?=(?:State(?:\s+Name|\s+of\s+Residence|\s*/\s*UT)?|District|Dist\.?|City|Town|Village|Tehsil|Tahsil|Taluka|Address|Country|PIN(?:\s*Code)?|Pin\s*Code|DOB|Date\s+of\s+Birth|Gender|Sex|Mobile|Phone|Email|Father(?:'s)?\s+Name|Mother(?:'s)?\s+Name|Husband(?:'s)?\s+Name|Wife(?:'s)?\s+Name|Spouse\s+Name|S/O|D/O|W/O|C/O|राज्य(?:\s+का\s+नाम)?|प्रदेश|जिला|जनपद|पता|ग्राम|गांव|तहसील|शहर|देश|पिन|पिता(?:\s+का\s+नाम)?|माता(?:\s+का\s+नाम)?|पति|पत्नी|जन्म\s*तिथि)\s*[:\-–])"""),
+            limit = 2
+        ).first()
+        return inlineFieldCut
     }
 
     private fun isValidHolderCandidate(
@@ -803,24 +977,64 @@ object DeterministicDocumentParser {
         orgName: String?,
         issuingAuth: String?,
         docName: String?,
-        originalFilename: String
+        originalFilename: String,
+        state: String? = null,
+        district: String? = null,
+        city: String? = null,
+        village: String? = null,
+        tehsil: String? = null,
+        address: String? = null
     ): Boolean {
         val clean = candidate.trim()
         if (clean.length < 2 || clean.length > 60) return false
         if (clean.any(Char::isDigit)) return false
+        if (clean.contains(',')) return false
         if (noiseHeadingRegex.matches(clean) || looksLikeAnotherLabel(clean)) return false
 
-        val lower = clean.lowercase()
+        val normalized = cleanPersonName(clean) ?: clean
+        val lower = normalized.lowercase()
         if (nonHolderRoleKeywords.any { kw -> lower.contains(kw) }) return false
+        if (nonHolderLocationWordRegex.containsMatchIn(normalized)) return false
+        if (nonHolderAddressCueRegex.containsMatchIn(normalized)) return false
+
+        // Reject any State / Union Territory / Country name
+        if (indianStatesAndUts.any { s -> normalized.equals(s, ignoreCase = true) || clean.equals(s, ignoreCase = true) }) {
+            return false
+        }
+        if (ocrStateAndCountryVariants.any { v -> lower == v || clean.equals(v, ignoreCase = true) }) {
+            return false
+        }
+        if (multiWordStatesAndUts.any { ms ->
+                Regex("""(?i)$BOUNDARY_START${Regex.escape(ms)}$BOUNDARY_END""").containsMatchIn(normalized)
+            }
+        ) {
+            return false
+        }
 
         val fileStem = originalFilename.substringBeforeLast('.').trim()
-        if (fileStem.isNotBlank() && clean.equals(fileStem, ignoreCase = true)) return false
+        if (fileStem.isNotBlank() && (clean.equals(fileStem, ignoreCase = true) || normalized.equals(fileStem, ignoreCase = true))) return false
         if (clean.equals(originalFilename.trim(), ignoreCase = true)) return false
+
+        val conflictingLocations = listOfNotNull(state, district, city, village, tehsil)
+        if (conflictingLocations.any { loc ->
+                val l = loc.trim()
+                l.isNotBlank() && (
+                    normalized.equals(l, ignoreCase = true) ||
+                        clean.equals(l, ignoreCase = true) ||
+                        (l.contains(' ') && normalized.contains(l, ignoreCase = true))
+                    )
+            }
+        ) {
+            return false
+        }
+        if (!address.isNullOrBlank() && normalized.equals(address.trim(), ignoreCase = true)) {
+            return false
+        }
 
         val conflictingRoles = listOfNotNull(fatherName, motherName, spouseName, orgName, issuingAuth, docName)
         if (conflictingRoles.any { role ->
                 val r = role.trim()
-                r.isNotBlank() && (clean.equals(r, ignoreCase = true) || (r.length >= 6 && clean.contains(r, ignoreCase = true)))
+                r.isNotBlank() && (clean.equals(r, ignoreCase = true) || normalized.equals(r, ignoreCase = true) || (r.length >= 6 && clean.contains(r, ignoreCase = true)))
             }
         ) {
             return false
@@ -837,7 +1051,13 @@ object DeterministicDocumentParser {
         orgName: String?,
         issuingAuth: String?,
         detectedName: String?,
-        originalFilename: String
+        originalFilename: String,
+        state: String? = null,
+        district: String? = null,
+        city: String? = null,
+        village: String? = null,
+        tehsil: String? = null,
+        address: String? = null
     ): String? {
         val dobIdx = lines.indexOfFirst {
             it.contains("DOB", true) || it.contains("Date of Birth", true) ||
@@ -849,7 +1069,8 @@ object DeterministicDocumentParser {
             val window = lines.subList((dobIdx - 4).coerceAtLeast(0), dobIdx)
             val validNames = window.mapNotNull { cleanPersonName(it) }.filter {
                 !it.contains("/") && isValidHolderCandidate(
-                    it, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename
+                    it, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename,
+                    state, district, city, village, tehsil, address
                 )
             }
             if (validNames.isNotEmpty()) return validNames.first()
@@ -860,7 +1081,8 @@ object DeterministicDocumentParser {
             val upWindow = lines.subList((dobIdx - 2).coerceAtLeast(0), dobIdx).reversed()
             val candidate = upWindow.mapNotNull { cleanPersonName(it) }.firstOrNull {
                 isValidHolderCandidate(
-                    it, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename
+                    it, fatherName, motherName, spouseName, orgName, issuingAuth, detectedName, originalFilename,
+                    state, district, city, village, tehsil, address
                 )
             }
             if (candidate != null) return candidate
@@ -1414,12 +1636,25 @@ object DeterministicDocumentParser {
     }
 
     private fun looksLikeAnotherLabel(text: String): Boolean {
-        val lower = text.lowercase().trimEnd(':', '-', ' ')
+        val trimmed = text.trim()
+        if (Regex(
+                """(?i)^(?:state|district|city|town|village|tehsil|address|country|pin(?:\s*code)?|dob|date\s+of\s+birth|gender|father|mother|husband|wife|spouse|राज्य|प्रदेश|जिला|जनपद|पता|ग्राम|गांव|तहसील|शहर|देश)\b[^:]{0,25}[:\-–]"""
+            ).containsMatchIn(trimmed)
+        ) {
+            return true
+        }
+        val lower = trimmed.lowercase().trimEnd(':', '-', '–', ' ')
         return lower in setOf(
-            "name", "father name", "father's name", "mother name", "spouse name",
+            "name", "owner name", "holder name", "cardholder name", "card holder name",
+            "applicant name", "account holder", "account holder name",
+            "father name", "father's name", "mother name", "mother's name",
+            "husband name", "husband's name", "spouse name",
             "dob", "date of birth", "gender", "address", "mobile", "email",
-            "issue date", "expiry date", "tehsil", "district", "village", "state", "pin code",
-            "नाम", "पता", "जन्म तिथि", "पिता", "माता", "तहसील", "जिला", "ग्राम", "आवेदन संख्या"
+            "issue date", "expiry date", "tehsil", "district", "village", "city", "town",
+            "state", "state name", "state of residence", "country", "country name", "pin", "pincode", "pin code",
+            "नाम", "धारक का नाम", "आवेदक का नाम", "कार्डधारक का नाम", "खाताधारक का नाम", "मालिक का नाम",
+            "पता", "जन्म तिथि", "पिता", "पिता का नाम", "माता", "माता का नाम", "पति का नाम", "पत्नी का नाम",
+            "तहसील", "जिला", "ग्राम", "शहर", "नगर", "राज्य", "राज्य का नाम", "प्रदेश", "देश", "पिन कोड", "आवेदन संख्या"
         )
     }
 }

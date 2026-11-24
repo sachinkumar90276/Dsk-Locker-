@@ -502,4 +502,193 @@ class AdvancedOcrTest {
         assertEquals("Tower B", meta.documentSpecificFields["Building Block"])
         assertEquals("B2-104", meta.documentSpecificFields["Parking Slot"])
     }
+
+    @Test
+    fun `state name and location labels before owner or holder name are never extracted as ownerName`() {
+        val ownerDoc = DeterministicDocumentParser.parseLocal(
+            fileId = "state-owner-1",
+            rawText = """
+                State Name: Uttar Pradesh
+                State of Residence: Uttar Pradesh
+                District: Lucknow
+                City: Lucknow
+                Country Name: India
+                Father's Name: Ramesh Kumar
+                Owner Name: Deepak Kumar
+                PIN Code: 226001
+            """.trimIndent(),
+            originalFilename = "property_doc.pdf",
+            mimeType = "application/pdf"
+        )
+        assertEquals("Deepak Kumar", ownerDoc.ownerName)
+        assertEquals("Uttar Pradesh", ownerDoc.state)
+        assertEquals("Ramesh Kumar", ownerDoc.fatherName)
+
+        val cardholderDoc = DeterministicDocumentParser.parseLocal(
+            fileId = "state-card-1",
+            rawText = """
+                State: Maharashtra
+                District: Pune
+                Cardholder Name: Sneha Kulkarni
+                State Name: Maharashtra
+            """.trimIndent(),
+            originalFilename = "card.jpg",
+            mimeType = "image/jpeg"
+        )
+        assertEquals("Sneha Kulkarni", cardholderDoc.ownerName)
+        assertEquals("Maharashtra", cardholderDoc.state)
+
+        val splitLineAndTwoColDoc = DeterministicDocumentParser.parseLocal(
+            fileId = "state-2col-1",
+            rawText = """
+                State: Gujarat   Name: Kiran Patel
+                District Name: Ahmedabad   City Name: Ahmedabad
+            """.trimIndent(),
+            originalFilename = "doc_2col.jpg",
+            mimeType = "image/jpeg"
+        )
+        assertEquals("Kiran Patel", splitLineAndTwoColDoc.ownerName)
+        assertEquals("Gujarat", splitLineAndTwoColDoc.state)
+
+        val splitLineOwner = DeterministicDocumentParser.parseLocal(
+            fileId = "state-split-1",
+            rawText = """
+                State Name: Rajasthan
+                Holder Name:
+                Pooja Rathore
+                District: Jaipur
+            """.trimIndent(),
+            originalFilename = "split_holder.pdf",
+            mimeType = "application/pdf"
+        )
+        assertEquals("Pooja Rathore", splitLineOwner.ownerName)
+        assertEquals("Rajasthan", splitLineOwner.state)
+    }
+
+    @Test
+    fun `hindi state and location labels do not override holder or applicant name`() {
+        val raw = """
+            राज्य का नाम: उत्तर प्रदेश
+            जिला: वाराणसी
+            पिता का नाम: हरीश तिवारी
+            आवेदक का नाम: विकास तिवारी
+            पिन कोड: 221001
+        """.trimIndent()
+
+        val meta = DeterministicDocumentParser.parseLocal(
+            fileId = "hi-state-1",
+            rawText = raw,
+            originalFilename = "hindi_form.jpg",
+            mimeType = "image/jpeg"
+        )
+
+        assertEquals("विकास तिवारी", meta.ownerName)
+        assertEquals("उत्तर प्रदेश", meta.state)
+        assertEquals("वाराणसी", meta.district)
+
+        val holderHindiRaw = """
+            राज्य: मध्य प्रदेश
+            धारक का नाम: मीना जोशी
+            तहसील: हुजूर
+            जिला: भोपाल
+        """.trimIndent()
+        val holderMeta = DeterministicDocumentParser.parseLocal(
+            fileId = "hi-state-2",
+            rawText = holderHindiRaw,
+            originalFilename = "hindi_holder.jpg",
+            mimeType = "image/jpeg"
+        )
+        assertEquals("मीना जोशी", holderMeta.ownerName)
+        assertEquals("मध्य प्रदेश", holderMeta.state)
+    }
+
+    @Test
+    fun `ownerName stays null when only state district address and relations exist without holder name`() {
+        val raw = """
+            GOVERNMENT FORM
+            State Name: Bihar
+            State of Residence: Bihar
+            Country Name: India
+            District: Patna
+            City: Patna
+            Village: Bihta
+            Father's Name: Mohan Lal
+            Mother's Name: Kamla Devi
+            Husband's Name: Rakesh Lal
+            Address: Ward 5, Bihta, Patna, Bihar - 801103
+            PIN Code: 801103
+        """.trimIndent()
+
+        val meta = DeterministicDocumentParser.parseLocal(
+            fileId = "no-holder-state",
+            rawText = raw,
+            originalFilename = "state_only.jpg",
+            mimeType = "image/jpeg"
+        )
+
+        assertNull(meta.ownerName)
+        assertEquals("Bihar", meta.state)
+        assertEquals(0, meta.scoreForField(DocumentFieldProfile.KEY_OWNER_NAME))
+        assertTrue(DocumentFieldProfile.KEY_OWNER_NAME in meta.needsReviewFields)
+    }
+
+    @Test
+    fun `reconcileWithAi rejects state name returned as ownerName by ai`() {
+        val raw = """
+            RESIDENCE CERTIFICATE
+            State Name: Maharashtra
+            District: Nagpur
+            Applicant Name: Rohan Deshpande
+            Father Name: Anil Deshpande
+        """.trimIndent()
+
+        val local = DeterministicDocumentParser.parseLocal(
+            fileId = "ai-state-guard",
+            rawText = raw,
+            originalFilename = "res.jpg",
+            mimeType = "image/jpeg"
+        )
+        val aiReturningState = ExtendedOcrMetadata(
+            fileId = "ai-state-guard",
+            documentType = "Residence Certificate",
+            ownerName = "Maharashtra",
+            state = "Maharashtra"
+        )
+        val merged = DeterministicDocumentParser.reconcileWithAi(
+            ai = aiReturningState,
+            localFallback = local,
+            rawText = raw,
+            stageSummary = "9-Stage Universal OCR"
+        )
+        assertEquals("Rohan Deshpande", merged.ownerName)
+        assertEquals("Maharashtra", merged.state)
+
+        // Also when there is NO holder name in the document at all, AI returning State must yield null
+        val noOwnerRaw = """
+            APPLICATION RECORD
+            State Name: Karnataka
+            City Name: Bengaluru
+            PIN Code: 560001
+        """.trimIndent()
+        val noOwnerLocal = DeterministicDocumentParser.parseLocal(
+            fileId = "ai-state-only",
+            rawText = noOwnerRaw,
+            originalFilename = "rec.jpg",
+            mimeType = "image/jpeg"
+        )
+        val aiStateOnly = ExtendedOcrMetadata(
+            fileId = "ai-state-only",
+            documentType = "Generic Document",
+            ownerName = "Karnataka",
+            state = "Karnataka"
+        )
+        val verifiedNoOwner = DeterministicDocumentParser.reconcileWithAi(
+            ai = aiStateOnly,
+            localFallback = noOwnerLocal,
+            rawText = noOwnerRaw,
+            stageSummary = "9-Stage Universal OCR"
+        )
+        assertNull(verifiedNoOwner.ownerName)
+        assertEquals("Karnataka", verifiedNoOwner.state)
+    }
 }

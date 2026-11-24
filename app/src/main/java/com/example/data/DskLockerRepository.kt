@@ -50,7 +50,7 @@ class DskLockerRepository(
 ) {
     private val db by lazy { DskLockerDatabase.getInstance(context) }
     val prefs by lazy { SecurePrefs(context) }
-    val phoneAuth by lazy { FirebasePhoneAuthManager() }
+    val phoneAuth by lazy { FirebasePhoneAuthManager(context.applicationContext ?: context) }
     val storageManager by lazy { FirebaseStorageManager() }
     val sqlClient by lazy { customSqlClient ?: SqlBackendClient() }
     private val ocrEngine by lazy { DocumentOcrEngine(context) }
