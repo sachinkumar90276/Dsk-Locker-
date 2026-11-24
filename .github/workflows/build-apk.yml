@@ -307,7 +307,7 @@ jobs:
             gradle :app:assembleDebug --no-daemon --stacktrace
           fi
 
-      - name: Verify APK exists
+      - name: Verify APK & Firebase Resources
         shell: bash
         run: |
           set -euo pipefail
@@ -318,6 +318,19 @@ jobs:
             exit 1
           fi
           ls -lh "$APK_PATH"
+          if [ -s app/google-services.json ]; then
+            AAPT2_BIN=$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools" -maxdepth 2 -type f -name aapt2 2>/dev/null | sort -V | tail -n 1 || true)
+            if [ -n "$AAPT2_BIN" ] && [ -x "$AAPT2_BIN" ]; then
+              RES_DUMP=$("$AAPT2_BIN" dump resources "$APK_PATH")
+              for key in default_web_client_id google_app_id gcm_defaultSenderId google_api_key google_storage_bucket project_id; do
+                if ! grep -q "string/$key" <<< "$RES_DUMP"; then
+                  echo "ERROR: Missing Firebase string resource '$key' inside compiled APK."
+                  exit 1
+                fi
+              done
+              echo "Verified Firebase string resources are packaged inside app-debug.apk."
+            fi
+          fi
 
       - name: Upload DSK-Locker-APK Artifact
         uses: actions/upload-artifact@v4

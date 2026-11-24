@@ -164,6 +164,21 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `firebase config generates default_web_client_id and initializes FirebaseApp when present`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val googleAppIdRes = app.resources.getIdentifier("google_app_id", "string", app.packageName)
+        if (googleAppIdRes != 0 && app.getString(googleAppIdRes).isNotBlank()) {
+            assertEquals("1:423136401995:android:feea03e41439adcf680bce", app.getString(googleAppIdRes))
+            val firebaseApp = com.google.firebase.FirebaseApp.initializeApp(app)
+                ?: com.google.firebase.FirebaseApp.getInstance()
+            assertEquals("gen-lang-client-0114461808", firebaseApp.options.projectId)
+            assertEquals("1:423136401995:android:feea03e41439adcf680bce", firebaseApp.options.applicationId)
+            val webClientId = app.getString(R.string.default_web_client_id)
+            assertTrue(webClientId.endsWith(".apps.googleusercontent.com"))
+        }
+    }
+
+    @Test
     fun `login mpin supports 4 and 6 digits and secret mpin rejects matching login mpin`() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         com.google.firebase.FirebaseApp.initializeApp(app)
