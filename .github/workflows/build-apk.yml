@@ -318,7 +318,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build Signed Android Release APK (Optional)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        id: build_release
         shell: bash
         env:
           RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
@@ -327,6 +327,12 @@ jobs:
           KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
         run: |
           set -euo pipefail
+          if [ -z "${RELEASE_KEYSTORE_B64:-}" ] || [ -z "${STORE_PASSWORD:-}" ] || [ -z "${KEY_PASSWORD:-}" ]; then
+            echo "Release signing secrets not configured; skipping signed Release APK."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          trap 'rm -f "$KEYSTORE_PATH"' EXIT
           printf '%s' "$RELEASE_KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_PATH"
           if [ -x ./gradlew ]; then
             ./gradlew :app:assembleRelease --no-daemon --stacktrace
@@ -335,16 +341,16 @@ jobs:
           else
             gradle :app:assembleRelease --no-daemon --stacktrace
           fi
-          rm -f "$KEYSTORE_PATH"
           RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
           if [ ! -s "$RELEASE_APK" ]; then
             echo "ERROR: Expected release APK was not generated at: $RELEASE_APK"
             exit 1
           fi
           ls -lh "$RELEASE_APK"
+          echo "built=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload DSK-Locker-Release-APK Artifact (Optional)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        if: steps.build_release.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: DSK-Locker-Release-APK
