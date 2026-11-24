@@ -2,6 +2,9 @@ package com.example
 
 import android.content.Context
 import android.util.Base64
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import com.example.ai.ExtendedOcrMetadata
 import com.example.ai.OcrMetadataStore
@@ -14,6 +17,8 @@ import com.example.data.remote.FirebasePhoneAuthManager
 import com.example.data.remote.FirebaseSessionUser
 import com.example.data.remote.SqlBackendClient
 import com.example.security.CryptoManager
+import com.example.storage.BackupFrequency
+import com.example.storage.BackupScheduler
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.Dispatchers
@@ -442,6 +447,113 @@ class CloudBackupRestoreTest {
         val mgr = FirebasePhoneAuthManager()
         assertTrue(mgr.formatAuthError(IllegalStateException("unknown status code: 17006"), isPhoneFlow = true).contains("17006"))
         assertTrue(mgr.formatAuthError(IllegalStateException("OPERATION_NOT_ALLOWED"), isPhoneFlow = false).contains("Email/Password"))
+    }
+
+    @Test
+    fun `BackupScheduler computes deterministic schedule delays, frequencies, and formatted times`() {
+        assertEquals(BackupFrequency.DAILY, BackupFrequency.fromId(null))
+        assertEquals(BackupFrequency.WEEKLY, BackupFrequency.fromId("weekly"))
+        assertEquals(BackupFrequency.MONTHLY, BackupFrequency.fromId("MONTHLY"))
+        assertEquals(7L, BackupFrequency.WEEKLY.intervalDays)
+        assertEquals(30L, BackupFrequency.MONTHLY.intervalDays)
+
+        assertEquals("02:00 AM", BackupScheduler.formatBackupTime(2, 0))
+        assertEquals("12:30 PM", BackupScheduler.formatBackupTime(12, 30))
+        assertEquals("12:05 AM", BackupScheduler.formatBackupTime(0, 5))
+        assertEquals("11:45 PM", BackupScheduler.formatBackupTime(23, 45))
+
+        val baseCal = java.util.Calendar.getInstance().apply {
+            set(2026, java.util.Calendar.NOVEMBER, 23, 10, 0, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        val nowMs = baseCal.timeInMillis
+        // Target 14:30 same day -> 4.5 hours later
+        val sameDayDelay = BackupScheduler.computeInitialDelayMillis(14, 30, nowMs)
+        assertEquals(4L * 60L * 60L * 1000L + 30L * 60L * 1000L, sameDayDelay)
+        // Target 02:00 already passed -> schedules for 02:00 next day (16 hours later)
+        val nextDayDelay = BackupScheduler.computeInitialDelayMillis(2, 0, nowMs)
+        assertEquals(16L * 60L * 60L * 1000L, nextDayDelay)
+    }
+
+    @Test
+    fun `Room MIGRATION_3_4 preserves user_settings row and adds schedule columns non-destructively`() {
+        val dbName = "migration_3_4_test.db"
+        context.deleteDatabase(dbName)
+        val helperConfig = SupportSQLiteOpenHelper.Configuration.builder(context)
+            .name(dbName)
+            .callback(object : SupportSQLiteOpenHelper.Callback(3) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE `user_settings` (
+                            `id` INTEGER NOT NULL PRIMARY KEY,
+                            `autoBackupEnabled` INTEGER NOT NULL,
+                            `wifiOnly` INTEGER NOT NULL,
+                            `backupPhotos` INTEGER NOT NULL,
+                            `backupVideos` INTEGER NOT NULL,
+                            `backupDocuments` INTEGER NOT NULL,
+                            `autoLockSeconds` INTEGER NOT NULL,
+                            `darkMode` INTEGER NOT NULL,
+                            `animations4DEnabled` INTEGER NOT NULL,
+                            `reducedMotion` INTEGER NOT NULL,
+                            `accentPreset` TEXT NOT NULL,
+                            `notificationsEnabled` INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        INSERT INTO `user_settings` VALUES (1, 1, 0, 1, 1, 1, 300, 1, 1, 0, 'CYAN_NEON', 1)
+                        """.trimIndent()
+                    )
+                }
+
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+            })
+            .build()
+        val helper = FrameworkSQLiteOpenHelperFactory().create(helperConfig)
+        val sqlite = helper.writableDatabase
+        DskLockerDatabase.MIGRATION_3_4.migrate(sqlite)
+
+        sqlite.query("SELECT autoBackupEnabled, wifiOnly, autoLockSeconds, chargingOnly, backupFrequency, backupHour, backupMinute FROM user_settings WHERE id = 1").use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals(1, cursor.getInt(0))
+            assertEquals(0, cursor.getInt(1))
+            assertEquals(300, cursor.getInt(2))
+            assertEquals(0, cursor.getInt(3))
+            assertEquals("DAILY", cursor.getString(4))
+            assertEquals(2, cursor.getInt(5))
+            assertEquals(0, cursor.getInt(6))
+        }
+        helper.close()
+        context.deleteDatabase(dbName)
+    }
+
+    @Test
+    fun `updateSettings persists chargingOnly, backupFrequency, and custom time in Room and syncs scheduler`() = runBlocking {
+        val repo = DskLockerRepository(
+            context = context,
+            customSqlClient = SqlBackendClient { baseUrl },
+            idTokenOverride = { "token-user-a" }
+        )
+        repo.ensureDefaultsInitialized()
+        repo.updateSettings {
+            it.copy(
+                autoBackupEnabled = true,
+                wifiOnly = true,
+                chargingOnly = true,
+                backupFrequency = BackupFrequency.WEEKLY.id,
+                backupHour = 21,
+                backupMinute = 45
+            )
+        }
+        val saved = DskLockerDatabase.getInstance(context).profileSettingsDao().getSettingsOnce()
+        assertNotNull(saved)
+        assertTrue(saved!!.chargingOnly)
+        assertEquals("WEEKLY", saved.backupFrequency)
+        assertEquals(21, saved.backupHour)
+        assertEquals(45, saved.backupMinute)
+        BackupScheduler.syncScheduleFromDatabase(context)
     }
 
     /**

@@ -16,6 +16,7 @@ import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseException
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthException
@@ -130,7 +131,11 @@ class FirebasePhoneAuthManager {
     private val auth: FirebaseAuth
         get() = Firebase.auth
 
-    fun currentUser(): com.google.firebase.auth.FirebaseUser? = runCatching { auth.currentUser }.getOrNull()
+    private fun isFirebaseReady(): Boolean =
+        runCatching { FirebaseApp.getInstance(); true }.getOrDefault(false)
+
+    fun currentUser(): com.google.firebase.auth.FirebaseUser? =
+        if (!isFirebaseReady()) null else runCatching { auth.currentUser }.getOrNull()
 
     suspend fun getFreshIdToken(forceRefresh: Boolean = false): String? {
         val user = currentUser() ?: return null
@@ -156,6 +161,7 @@ class FirebasePhoneAuthManager {
     }
 
     suspend fun attemptSilentGoogleSignIn(context: Context): FirebaseSessionUser? {
+        if (!isFirebaseReady()) return null
         currentUser()?.let { existing ->
             val token = runCatching { existing.getIdToken(false).await()?.token }.getOrNull()
             if (!token.isNullOrBlank()) {
@@ -212,6 +218,9 @@ class FirebasePhoneAuthManager {
     }
 
     suspend fun signInWithGoogle(context: Context): GoogleSignInResult {
+        if (!isFirebaseReady()) {
+            return GoogleSignInResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration.")
+        }
         val clientId = try {
             context.getString(R.string.default_web_client_id)
         } catch (_: Exception) {
@@ -276,6 +285,10 @@ class FirebasePhoneAuthManager {
         resendToken: PhoneAuthProvider.ForceResendingToken? = null,
         onResult: (PhoneOtpStartResult) -> Unit
     ) {
+        if (!isFirebaseReady()) {
+            onResult(PhoneOtpStartResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration."))
+            return
+        }
         val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
             override fun onVerificationCompleted(credential: PhoneAuthCredential) {
                 auth.signInWithCredential(credential)
@@ -336,6 +349,7 @@ class FirebasePhoneAuthManager {
         smsCode: String,
         expectedPhoneE164: String
     ): Result<FirebaseSessionUser> = runCatching {
+        check(isFirebaseReady()) { "Firebase is not initialized in this build." }
         val credential = PhoneAuthProvider.getCredential(verificationId, smsCode)
         val authResult = auth.signInWithCredential(credential).await()
         val user = authResult.user ?: throw IllegalStateException("Firebase Phone authentication returned null user.")
@@ -357,6 +371,9 @@ class FirebasePhoneAuthManager {
         password: String,
         displayName: String? = null
     ): EmailAuthResult {
+        if (!isFirebaseReady()) {
+            return EmailAuthResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration.")
+        }
         val cleanEmail = email.trim()
         if (!AuthValidation.isValidEmail(cleanEmail)) {
             return EmailAuthResult.Error("Enter a valid email address.")
@@ -407,6 +424,9 @@ class FirebasePhoneAuthManager {
         email: String,
         password: String
     ): EmailAuthResult {
+        if (!isFirebaseReady()) {
+            return EmailAuthResult.Error("Firebase is not initialized in this build. Verify google-services.json configuration.")
+        }
         val cleanEmail = email.trim()
         if (!AuthValidation.isValidEmail(cleanEmail)) {
             return EmailAuthResult.Error("Enter a valid email address.")
@@ -441,6 +461,9 @@ class FirebasePhoneAuthManager {
     }
 
     suspend fun sendPasswordResetEmail(email: String): Result<Unit> {
+        if (!isFirebaseReady()) {
+            return Result.failure(IllegalStateException("Firebase is not initialized in this build."))
+        }
         val cleanEmail = email.trim()
         if (!AuthValidation.isValidEmail(cleanEmail)) {
             return Result.failure(IllegalArgumentException("Enter a valid email address to reset your password."))

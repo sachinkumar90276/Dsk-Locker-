@@ -3,7 +3,9 @@ package com.example.storage
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -26,6 +28,7 @@ import androidx.work.WorkerParameters
 import com.example.R
 import com.example.data.DskLockerRepository
 import com.example.data.local.DskLockerDatabase
+import com.example.data.local.UserSettingsEntity
 import com.example.data.remote.BackendConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,7 +36,23 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
+import java.util.Calendar
 import java.util.concurrent.TimeUnit
+
+enum class BackupFrequency(
+    val id: String,
+    val label: String,
+    val intervalDays: Long
+) {
+    DAILY("DAILY", "Daily", 1L),
+    WEEKLY("WEEKLY", "Weekly", 7L),
+    MONTHLY("MONTHLY", "Monthly", 30L);
+
+    companion object {
+        fun fromId(id: String?): BackupFrequency =
+            entries.firstOrNull { it.id.equals(id?.trim(), ignoreCase = true) } ?: DAILY
+    }
+}
 
 class AutoBackupWorker(
     appContext: Context,
@@ -102,6 +121,24 @@ class ExpiryReminderWorker(
             if (parsed != null) return parsed
         }
         return null
+    }
+}
+
+class DskBootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        val action = intent?.action ?: return
+        if (action == Intent.ACTION_BOOT_COMPLETED || action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+            val pendingResult = goAsync()
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val appCtx = context.applicationContext ?: context
+                    runCatching { BackupScheduler.syncScheduleFromDatabase(appCtx) }
+                    runCatching { DskLockerRepository(appCtx).recoverInterruptedBackups() }
+                } finally {
+                    pendingResult.finish()
+                }
+            }
+        }
     }
 }
 
@@ -203,25 +240,90 @@ class ConnectivityBackupMonitor(
 }
 
 object BackupScheduler {
-    fun schedulePeriodicAutoBackup(context: Context, enabled: Boolean, wifiOnly: Boolean) {
+    const val PERIODIC_WORK_NAME = "dsk_periodic_backup"
+    const val IMMEDIATE_WORK_NAME = "dsk_manual_backup"
+    const val EXPIRY_WORK_NAME = "dsk_expiry_reminders"
+
+    fun computeInitialDelayMillis(
+        targetHour: Int,
+        targetMinute: Int,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Long {
+        val safeHour = targetHour.coerceIn(0, 23)
+        val safeMinute = targetMinute.coerceIn(0, 59)
+        val targetCal = Calendar.getInstance().apply {
+            timeInMillis = nowMillis
+            set(Calendar.HOUR_OF_DAY, safeHour)
+            set(Calendar.MINUTE, safeMinute)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        if (targetCal.timeInMillis <= nowMillis + 60_000L) {
+            targetCal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+        return (targetCal.timeInMillis - nowMillis).coerceAtLeast(60_000L)
+    }
+
+    fun formatBackupTime(hour: Int, minute: Int): String {
+        val safeH = hour.coerceIn(0, 23)
+        val safeM = minute.coerceIn(0, 59)
+        val amPm = if (safeH < 12) "AM" else "PM"
+        val displayH = when {
+            safeH == 0 -> 12
+            safeH > 12 -> safeH - 12
+            else -> safeH
+        }
+        return "%02d:%02d %s".format(displayH, safeM, amPm)
+    }
+
+    fun schedulePeriodicAutoBackup(
+        context: Context,
+        enabled: Boolean,
+        wifiOnly: Boolean,
+        chargingOnly: Boolean = false,
+        frequency: String = BackupFrequency.DAILY.id,
+        hour: Int = 2,
+        minute: Int = 0
+    ) {
         val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
         if (!enabled) {
-            wm.cancelUniqueWork("dsk_periodic_backup")
+            wm.cancelUniqueWork(PERIODIC_WORK_NAME)
             return
         }
+        val freq = BackupFrequency.fromId(frequency)
         val netType = if (wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(netType)
+            .setRequiresCharging(chargingOnly)
             .build()
-        val request = PeriodicWorkRequestBuilder<AutoBackupWorker>(6, TimeUnit.HOURS)
+        val initialDelayMs = computeInitialDelayMillis(hour, minute)
+        val request = PeriodicWorkRequestBuilder<AutoBackupWorker>(freq.intervalDays, TimeUnit.DAYS)
+            .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
             .setConstraints(constraints)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
         wm.enqueueUniquePeriodicWork(
-            "dsk_periodic_backup",
+            PERIODIC_WORK_NAME,
             ExistingPeriodicWorkPolicy.UPDATE,
             request
         )
+    }
+
+    suspend fun syncScheduleFromDatabase(context: Context) {
+        val db = DskLockerDatabase.getInstance(context)
+        val settings = db.profileSettingsDao().getSettingsOnce() ?: UserSettingsEntity()
+        schedulePeriodicAutoBackup(
+            context = context,
+            enabled = settings.autoBackupEnabled,
+            wifiOnly = settings.wifiOnly,
+            chargingOnly = settings.chargingOnly,
+            frequency = settings.backupFrequency,
+            hour = settings.backupHour,
+            minute = settings.backupMinute
+        )
+        if (settings.notificationsEnabled && db.documentReminderDao().getAllOnce().isNotEmpty()) {
+            scheduleDailyExpiryCheck(context)
+        }
     }
 
     fun enqueueImmediateBackup(context: Context, wifiOnly: Boolean) {
@@ -232,7 +334,7 @@ object BackupScheduler {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 20, TimeUnit.SECONDS)
             .build()
         wm.enqueueUniqueWork(
-            "dsk_manual_backup",
+            IMMEDIATE_WORK_NAME,
             ExistingWorkPolicy.REPLACE,
             req
         )
@@ -242,7 +344,7 @@ object BackupScheduler {
         val wm = runCatching { WorkManager.getInstance(context) }.getOrNull() ?: return
         val req = PeriodicWorkRequestBuilder<ExpiryReminderWorker>(12, TimeUnit.HOURS).build()
         wm.enqueueUniquePeriodicWork(
-            "dsk_expiry_reminders",
+            EXPIRY_WORK_NAME,
             ExistingPeriodicWorkPolicy.KEEP,
             req
         )

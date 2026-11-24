@@ -407,10 +407,15 @@ object LocalFileManager {
         val durationMs: Long
     )
 
-    suspend fun getVideoPreviewMeta(context: Context, item: FileItemEntity): VideoPreviewMeta = withContext(Dispatchers.IO) {
+    suspend fun getVideoPreviewMeta(
+        context: Context,
+        item: FileItemEntity,
+        portableVaultKeyBase64: String? = null
+    ): VideoPreviewMeta = withContext(Dispatchers.IO) {
         val thumbDir = File(context.cacheDir, "video_thumbs").apply { mkdirs() }
         val thumbFile = File(thumbDir, "${item.id}.jpg")
-        val readable = resolveReadableFile(context, item) ?: return@withContext VideoPreviewMeta(null, 0L)
+        val readable = resolveReadableFile(context, item, portableVaultKeyBase64)
+            ?: return@withContext VideoPreviewMeta(null, 0L)
         val retriever = android.media.MediaMetadataRetriever()
         var duration = 0L
         var resultThumb: File? = if (thumbFile.exists() && thumbFile.length() > 0L) thumbFile else null

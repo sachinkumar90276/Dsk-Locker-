@@ -13,6 +13,7 @@ import com.example.data.local.*
 import com.example.data.remote.*
 import com.example.security.CryptoManager
 import com.example.security.SecurePrefs
+import com.example.storage.BackupFrequency
 import com.example.storage.BackupScheduler
 import com.example.storage.DeviceStorageStats
 import com.example.storage.LocalFileManager
@@ -105,6 +106,7 @@ class DskLockerRepository(
         if (db.profileSettingsDao().getSettingsOnce() == null) {
             db.profileSettingsDao().upsertSettings(UserSettingsEntity())
         }
+        runCatching { BackupScheduler.syncScheduleFromDatabase(context) }
     }
 
     fun hasFirebaseSession(): Boolean =
@@ -394,6 +396,13 @@ class DskLockerRepository(
             portableVaultKeyBase64 = if (file.isInVault) prefs.getPortableVaultKeyBase64() else null
         )
 
+    suspend fun getVideoPreviewMeta(file: FileItemEntity): LocalFileManager.VideoPreviewMeta =
+        LocalFileManager.getVideoPreviewMeta(
+            context = context,
+            item = file,
+            portableVaultKeyBase64 = if (file.isInVault) prefs.getPortableVaultKeyBase64() else null
+        )
+
     // --- Files & Vault ---
     suspend fun importFiles(
         uris: List<Uri>,
@@ -489,6 +498,10 @@ class DskLockerRepository(
             )
             db.fileItemDao().upsert(copyItem)
             syncFileMetadata(copyItem)
+            val settings = db.profileSettingsDao().getSettingsOnce()
+            if (copiedPath != null && settings?.autoBackupEnabled == true) {
+                BackupScheduler.enqueueImmediateBackup(context, settings.wifiOnly)
+            }
         } else {
             val moved = file.copy(
                 categoryId = targetCategoryId,
@@ -1716,7 +1729,15 @@ class DskLockerRepository(
         val current = db.profileSettingsDao().getSettingsOnce() ?: UserSettingsEntity()
         val updated = transform(current)
         db.profileSettingsDao().upsertSettings(updated)
-        BackupScheduler.schedulePeriodicAutoBackup(context, updated.autoBackupEnabled, updated.wifiOnly)
+        BackupScheduler.schedulePeriodicAutoBackup(
+            context = context,
+            enabled = updated.autoBackupEnabled,
+            wifiOnly = updated.wifiOnly,
+            chargingOnly = updated.chargingOnly,
+            frequency = updated.backupFrequency,
+            hour = updated.backupHour,
+            minute = updated.backupMinute
+        )
         val token = resolveIdToken()
         if (!token.isNullOrBlank() && isBackendConfiguredForClient()) {
             sqlClient.updateBackupSettings(

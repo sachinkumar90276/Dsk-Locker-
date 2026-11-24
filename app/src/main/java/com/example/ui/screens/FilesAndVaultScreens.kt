@@ -555,6 +555,7 @@ fun FilesExplorerScreen(
                     if (isVideoItem && !selectionMode) {
                         VideoItemRowCard(
                             file = file,
+                            onLoadMeta = { viewModel.getVideoPreviewMeta(file) },
                             onOpen = { fileForActionSheet = file },
                             onFavorite = { viewModel.toggleFavorite(file) },
                             onDeleteRequest = { pendingDeleteTargets = listOf(file) }
@@ -795,13 +796,13 @@ private fun SheetActionRow(
 @Composable
 fun VideoItemRowCard(
     file: FileItemEntity,
+    onLoadMeta: suspend () -> LocalFileManager.VideoPreviewMeta,
     onOpen: () -> Unit,
     onFavorite: () -> Unit,
     onDeleteRequest: () -> Unit
 ) {
-    val context = LocalContext.current
-    val videoMeta by produceState<LocalFileManager.VideoPreviewMeta?>(initialValue = null, file.id, file.localPath) {
-        value = LocalFileManager.getVideoPreviewMeta(context, file)
+    val videoMeta by produceState<LocalFileManager.VideoPreviewMeta?>(initialValue = null, file.id, file.localPath, file.isInVault) {
+        value = onLoadMeta()
     }
 
     GlassCard4D(

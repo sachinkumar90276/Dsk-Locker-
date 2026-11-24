@@ -47,6 +47,8 @@ import com.example.data.remote.AuthValidation
 import com.example.data.remote.SqlSchemaViewerData
 import com.example.security.BiometricAvailability
 import com.example.security.BiometricHelper
+import com.example.storage.BackupFrequency
+import com.example.storage.BackupScheduler
 import com.example.storage.LocalFileManager
 import com.example.ui.DskLockerViewModel
 import com.example.ui.components.*
@@ -66,6 +68,38 @@ private data class RestoreDisplayRow(
     val backupStatus: BackupStatus,
     val hasLocalCopy: Boolean
 )
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BackupTimePickerDialog(
+    initialHour: Int,
+    initialMinute: Int,
+    onDismiss: () -> Unit,
+    onSave: (hour: Int, minute: Int) -> Unit
+) {
+    val timeState = rememberTimePickerState(
+        initialHour = initialHour,
+        initialMinute = initialMinute,
+        is24Hour = false
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Select Backup Start Time", color = SilverWhite) },
+        text = {
+            TimePicker(state = timeState)
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSave(timeState.hour, timeState.minute) },
+                colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                modifier = Modifier.testTag("backup_time_save_button")
+            ) { Text("Save Time") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
 
 @Composable
 fun BackupRestoreScreen(
@@ -423,6 +457,13 @@ fun BackupRestoreScreen(
                         SettingSwitchRow("Wi-Fi Only", if (settings.wifiOnly) "Wi-Fi Only enabled" else "Mobile Data allowed", settings.wifiOnly) { v ->
                             viewModel.updateSettings { it.copy(wifiOnly = v) }
                         }
+                        SettingSwitchRow(
+                            "Charging Only",
+                            if (settings.chargingOnly) "Auto-backup waits until charger is connected" else "Runs on battery or charger",
+                            settings.chargingOnly
+                        ) { v ->
+                            viewModel.updateSettings { it.copy(chargingOnly = v) }
+                        }
                         SettingSwitchRow("Photos Backup", "Auto-backup Photos & personal images", settings.backupPhotos) { v ->
                             viewModel.updateSettings { it.copy(backupPhotos = v) }
                         }
@@ -431,6 +472,40 @@ fun BackupRestoreScreen(
                         }
                         SettingSwitchRow("Documents Backup", "PDF, DOCX, Excel, OCR & Reminders", settings.backupDocuments) { v ->
                             viewModel.updateSettings { it.copy(backupDocuments = v) }
+                        }
+                        HorizontalDivider(color = ElectricBlue.copy(alpha = 0.2f), modifier = Modifier.padding(vertical = 8.dp))
+                        Text("Automatic Backup Schedule", style = MaterialTheme.typography.titleSmall, color = ElectricBlue)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            BackupFrequency.entries.forEach { freq ->
+                                val selected = BackupFrequency.fromId(settings.backupFrequency) == freq
+                                FilterChip(
+                                    selected = selected,
+                                    onClick = { viewModel.updateSettings { it.copy(backupFrequency = freq.id) } },
+                                    label = { Text(freq.label, fontSize = 12.sp) },
+                                    modifier = Modifier.testTag("backup_freq_${freq.id.lowercase()}")
+                                )
+                            }
+                        }
+                        var showBackupTimePicker by remember { mutableStateOf(false) }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        ActionRow(
+                            icon = Icons.Filled.Schedule,
+                            title = "Preferred Backup Time",
+                            subtitle = "${BackupFrequency.fromId(settings.backupFrequency).label} window starting ${BackupScheduler.formatBackupTime(settings.backupHour, settings.backupMinute)}"
+                        ) {
+                            showBackupTimePicker = true
+                        }
+                        if (showBackupTimePicker) {
+                            BackupTimePickerDialog(
+                                initialHour = settings.backupHour,
+                                initialMinute = settings.backupMinute,
+                                onDismiss = { showBackupTimePicker = false },
+                                onSave = { h, m ->
+                                    viewModel.updateSettings { it.copy(backupHour = h, backupMinute = m) }
+                                    showBackupTimePicker = false
+                                }
+                            )
                         }
                     }
                 }
@@ -1629,6 +1704,7 @@ fun ProfileSettingsScreen(
             },
             onForgotMpin = {
                 showChangeMpinVerify = false
+                viewModel.logForgotMpinVerified("Unlocked Session")
                 viewModel.startForgotMpin()
             }
         )

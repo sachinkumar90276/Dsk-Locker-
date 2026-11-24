@@ -34,7 +34,7 @@ class DskTypeConverters {
         BackupSnapshotEntity::class,
         PendingSyncOpEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 @TypeConverters(DskTypeConverters::class)
@@ -95,6 +95,15 @@ abstract class DskLockerDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `user_settings` ADD COLUMN `chargingOnly` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `user_settings` ADD COLUMN `backupFrequency` TEXT NOT NULL DEFAULT 'DAILY'")
+                db.execSQL("ALTER TABLE `user_settings` ADD COLUMN `backupHour` INTEGER NOT NULL DEFAULT 2")
+                db.execSQL("ALTER TABLE `user_settings` ADD COLUMN `backupMinute` INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun getInstance(context: Context): DskLockerDatabase {
             val appCtx = context.applicationContext ?: context
             return INSTANCE ?: synchronized(this) {
@@ -103,7 +112,7 @@ abstract class DskLockerDatabase : RoomDatabase() {
                     DskLockerDatabase::class.java,
                     "dsk_locker_db"
                 )
-                    .addMigrations(MIGRATION_2_3)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { INSTANCE = it }
             }

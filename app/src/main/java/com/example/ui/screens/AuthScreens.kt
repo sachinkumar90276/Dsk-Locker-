@@ -549,23 +549,206 @@ fun MpinLoginScreen(viewModel: DskLockerViewModel) {
     }
 
     if (showForgotConfirm) {
+        val canBiometricVerify = bioAvail is BiometricAvailability.Available
+        val hasSecretVerify = viewModel.hasSecretMpin()
+        val hasCloudVerify = viewModel.hasLinkedCloudAccount()
+        val hasAnyOwnerFactor = canBiometricVerify || hasSecretVerify || hasCloudVerify
+
+        var secretPinInput by remember { mutableStateOf("") }
+        var showSecretPad by remember { mutableStateOf(hasSecretVerify && !canBiometricVerify) }
+        var cloudVerifying by remember { mutableStateOf(false) }
+        var gateError by remember { mutableStateOf<String?>(null) }
+        val secretLen = viewModel.secretMpinLength()
+
         AlertDialog(
-            onDismissRequest = { showForgotConfirm = false },
-            title = { Text("Reset Login MPIN?") },
-            text = { Text("Create a new 4-digit or 6-digit Login MPIN for DSK LOCKER. All your existing files, vault items, and notes remain preserved.") },
+            onDismissRequest = {
+                if (!cloudVerifying) showForgotConfirm = false
+            },
+            title = {
+                Text(
+                    text = if (hasAnyOwnerFactor) "Verify Owner to Reset MPIN" else "Reset Local Login MPIN?",
+                    color = SilverWhite
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (hasAnyOwnerFactor) {
+                            "Authenticate with Biometric, Secret MPIN, or your linked Cloud Account before setting a new Login MPIN. All files, vault items, and notes remain preserved."
+                        } else {
+                            "No Secret MPIN, biometric hardware, or linked cloud account is configured yet. Resetting creates a new Login MPIN while preserving all encrypted files and notes."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MetallicSilver
+                    )
+
+                    if (lockoutSeconds > 0) {
+                        Text(
+                            text = "Locked for ${lockoutSeconds}s due to failed attempts.",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = CrimsonAlert
+                        )
+                    }
+                    if (gateError != null) {
+                        Text(
+                            text = gateError!!,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = CrimsonAlert
+                        )
+                    }
+
+                    if (canBiometricVerify) {
+                        Button(
+                            onClick = {
+                                gateError = null
+                                if (activity == null) {
+                                    gateError = "Biometric prompt unavailable in current window."
+                                } else {
+                                    BiometricHelper.authenticate(
+                                        activity = activity,
+                                        title = "Verify Owner Identity",
+                                        subtitle = "Authenticate to reset DSK LOCKER Login MPIN",
+                                        onSuccess = {
+                                            showForgotConfirm = false
+                                            viewModel.logForgotMpinVerified("Biometric")
+                                            viewModel.startForgotMpin()
+                                        },
+                                        onFailure = { msg -> gateError = msg }
+                                    )
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(46.dp)
+                                .testTag("forgot_mpin_verify_biometric")
+                        ) {
+                            Icon(Icons.Filled.Fingerprint, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Verify with Biometric", fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    if (hasSecretVerify) {
+                        OutlinedButton(
+                            onClick = {
+                                gateError = null
+                                showSecretPad = !showSecretPad
+                                secretPinInput = ""
+                            },
+                            border = BorderStroke(1.dp, NeonViolet.copy(alpha = 0.7f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .testTag("forgot_mpin_toggle_secret")
+                        ) {
+                            Icon(Icons.Filled.Security, contentDescription = null, tint = NeonViolet, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (showSecretPad) "Hide Secret MPIN Keypad" else "Verify with ${secretLen}-Digit Secret MPIN",
+                                color = SilverWhite
+                            )
+                        }
+
+                        if (showSecretPad) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                MpinDots(
+                                    length = secretPinInput.length,
+                                    maxDigits = secretLen,
+                                    isError = gateError != null
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                MpinKeypad(
+                                    enabled = lockoutSeconds <= 0 && !cloudVerifying,
+                                    buttonSize = 48.dp,
+                                    verticalSpacing = 6.dp,
+                                    onDigit = { d ->
+                                        gateError = null
+                                        if (secretPinInput.length < secretLen) {
+                                            val next = secretPinInput + d
+                                            secretPinInput = next
+                                            if (next.length == secretLen) {
+                                                if (viewModel.verifySecretMpinForDelete(next)) {
+                                                    showForgotConfirm = false
+                                                    viewModel.logForgotMpinVerified("Secret MPIN")
+                                                    viewModel.startForgotMpin()
+                                                } else {
+                                                    secretPinInput = ""
+                                                    gateError = "Incorrect Secret MPIN."
+                                                }
+                                            }
+                                        }
+                                    },
+                                    onBackspace = {
+                                        if (secretPinInput.isNotEmpty()) {
+                                            secretPinInput = secretPinInput.dropLast(1)
+                                            gateError = null
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    if (hasCloudVerify) {
+                        OutlinedButton(
+                            onClick = {
+                                gateError = null
+                                cloudVerifying = true
+                                viewModel.verifyCloudOwnerForMpinReset(
+                                    uiContext = context,
+                                    onVerified = {
+                                        cloudVerifying = false
+                                        showForgotConfirm = false
+                                        viewModel.startForgotMpin()
+                                    },
+                                    onError = { msg ->
+                                        cloudVerifying = false
+                                        gateError = msg
+                                    }
+                                )
+                            },
+                            enabled = !cloudVerifying,
+                            border = BorderStroke(1.dp, EmeraldSync.copy(alpha = 0.7f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(46.dp)
+                                .testTag("forgot_mpin_verify_cloud")
+                        ) {
+                            if (cloudVerifying) {
+                                CircularProgressIndicator(color = EmeraldSync, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                            } else {
+                                Icon(Icons.Filled.CloudDone, contentDescription = null, tint = EmeraldSync, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Verify Linked Cloud Account", color = EmeraldSync, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            },
             confirmButton = {
-                Button(
-                    onClick = {
-                        showForgotConfirm = false
-                        viewModel.startForgotMpin()
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack)
-                ) {
-                    Text("Set New MPIN")
+                if (!hasAnyOwnerFactor) {
+                    Button(
+                        onClick = {
+                            showForgotConfirm = false
+                            viewModel.logForgotMpinLocalReset()
+                            viewModel.startForgotMpin()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue, contentColor = VoidBlack),
+                        modifier = Modifier.testTag("forgot_mpin_local_reset_button")
+                    ) {
+                        Text("Set New MPIN")
+                    }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showForgotConfirm = false }) { Text("Cancel") }
+                TextButton(
+                    onClick = { showForgotConfirm = false },
+                    enabled = !cloudVerifying
+                ) { Text("Cancel") }
             }
         )
     }

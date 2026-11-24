@@ -285,6 +285,59 @@ class DskLockerViewModel(application: Application) : AndroidViewModel(applicatio
 
     suspend fun resolveReadableFile(file: FileItemEntity): File? = repo.resolveReadableFile(file)
 
+    suspend fun getVideoPreviewMeta(file: FileItemEntity): LocalFileManager.VideoPreviewMeta =
+        repo.getVideoPreviewMeta(file)
+
+    fun hasLinkedCloudAccount(): Boolean =
+        !repo.prefs.firebaseUid.isNullOrBlank() ||
+            repo.hasFirebaseSession() ||
+            !repo.prefs.ownerEmail.isNullOrBlank() ||
+            !repo.prefs.ownerPhone.isNullOrBlank()
+
+    fun logForgotMpinVerified(method: String) {
+        viewModelScope.launch {
+            repo.logSecurity("FORGOT_MPIN_VERIFIED", "Owner verified via $method before MPIN reset", true)
+        }
+    }
+
+    fun logForgotMpinLocalReset() {
+        viewModelScope.launch {
+            repo.logSecurity(
+                "FORGOT_MPIN_LOCAL_UNBOUND",
+                "Local Login MPIN reset completed with no biometric, Secret MPIN, or linked cloud account",
+                true
+            )
+        }
+    }
+
+    fun verifyCloudOwnerForMpinReset(
+        uiContext: Context,
+        onVerified: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        viewModelScope.launch {
+            val activeUser = repo.phoneAuth.currentUser()
+            val expectedUid = repo.prefs.firebaseUid
+            if (activeUser != null && (expectedUid.isNullOrBlank() || activeUser.uid == expectedUid)) {
+                val freshToken = repo.phoneAuth.getFreshIdToken(true)
+                if (!freshToken.isNullOrBlank()) {
+                    repo.logSecurity("FORGOT_MPIN_CLOUD_SESSION_VERIFIED", "Owner verified active cloud session (${activeUser.uid})", true)
+                    onVerified()
+                    return@launch
+                }
+            }
+            when (val res = repo.signInWithGoogle(uiContext)) {
+                is GoogleSignInResult.Success -> {
+                    _cloudSessionActive.value = true
+                    repo.logSecurity("FORGOT_MPIN_GOOGLE_VERIFIED", "Owner verified via Google Sign-In (${res.session.uid})", true)
+                    onVerified()
+                }
+                is GoogleSignInResult.Cancelled -> onError("Cloud account verification cancelled.")
+                is GoogleSignInResult.Error -> onError(res.message)
+            }
+        }
+    }
+
     fun logout() {
         viewModelScope.launch {
             _vaultUnlocked.value = false
